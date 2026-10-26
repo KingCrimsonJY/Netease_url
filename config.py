@@ -49,6 +49,7 @@ class Settings:
     api_token: str = ""
     cors_origins: tuple[str, ...] = ()
     rate_limit_per_minute: int = 60
+    trust_proxy: bool = False  # 部署在反向代理后面时开启，按 X-Forwarded-For 识别客户端 IP
     log_level: str = "INFO"
 
     # 账号与设备身份
@@ -146,8 +147,10 @@ def validate_template(template: str) -> None:
         raise ConfigError("FILENAME_TEMPLATE 渲染结果为空")
 
 
-def _convert(name: str, raw: str) -> object:
-    raw = raw.strip()
+def _convert(name: str, value: str) -> object:
+    raw = value.strip()
+    if name in ("artist_separator", "filename_template"):
+        return value  # 这两项允许首尾空格（如分隔符 ", "）
     try:
         if name in (
             "port",
@@ -161,7 +164,7 @@ def _convert(name: str, raw: str) -> object:
             return int(raw)
         if name == "max_cache_gb":
             return float(raw)
-        if name == "fullwidth_replace":
+        if name in ("fullwidth_replace", "trust_proxy"):
             return raw.lower() in ("1", "true", "yes", "on")
         if name == "cors_origins":
             return tuple(o.strip() for o in raw.split(",") if o.strip())

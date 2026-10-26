@@ -38,6 +38,13 @@ def test_invalid_values_are_rejected(env):
         Settings.from_env(env)
 
 
+def test_env_example_is_valid_and_keeps_spaces():
+    environ: dict[str, str] = {}
+    load_dotenv(BASE_DIR / ".env.example", environ)
+    s = Settings.from_env(environ)
+    assert s.artist_separator == ", " and s.filename_template == "{artists} - {title}"
+
+
 def test_dotenv_does_not_override_existing(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text(

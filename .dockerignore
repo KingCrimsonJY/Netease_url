@@ -1,3 +1,26 @@
-LICENSE
-README.md
-.gitignore
+.git
+.github
+.claude
+.idea
+.vscode
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+
+# 凭据与本地配置绝不能打包进镜像
+.env
+cookie.txt
+cookie.*.txt
+*.bak
+
+# 运行数据与文档
+data
+downloads
+Music
+*.log
+*.part
+*.md

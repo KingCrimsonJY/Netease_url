@@ -1,5 +1,6 @@
 import hashlib
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -81,6 +82,35 @@ class FakeClient:
     def lyrics(self, song_id: int) -> Lyrics:
         return Lyrics(lrc="[00:00.000] 作词 : 唐恬\n[00:01.00]歌词")
 
+    # ----- 账号与扫码登录 -----
+    cookie = {"MUSIC_U": "u"}
+    svip_expire = int((time.time() + 10.5 * 86400) * 1000)
+    qr_codes = [801, 802, 803]
+
+    def user_cookies(self) -> dict:
+        return dict(self.cookie)
+
+    def account(self) -> dict:
+        return {"logged_in": True, "user_id": 7, "nickname": "测试用户", "vip_type": 11}
+
+    def vip_info(self) -> dict:
+        return {"svip_expire": self.svip_expire, "vip_expire": None, "music_package_expire": None}
+
+    def qr_unikey(self) -> str:
+        return "key-0123456789"
+
+    def qr_check(self, key: str) -> dict:
+        if not hasattr(self, "_qr"):
+            self._qr = list(self.qr_codes)
+        code = self._qr.pop(0)
+        cookies = {"MUSIC_U": "new", "__csrf": "c"} if code == 803 else {}
+        return {
+            "code": code,
+            "message": "",
+            "nickname": "测试用户" if code == 802 else None,
+            "cookies": cookies,
+        }
+
 
 class FakeFetcher:
     """模拟 CDN 下载：把对应内容写进 .part，并统计调用次数。"""
@@ -110,7 +140,12 @@ class FakeFetcher:
 
 @pytest.fixture
 def settings(tmp_path) -> Settings:
-    return replace(Settings.from_env({}), data_dir=tmp_path / "data", cover_size=0)
+    return replace(
+        Settings.from_env({}),
+        data_dir=tmp_path / "data",
+        cookie_file=tmp_path / "cookie.txt",
+        cover_size=0,
+    )
 
 
 @pytest.fixture

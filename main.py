@@ -6,23 +6,32 @@
 from __future__ import annotations
 
 import logging
+import math
+import re
+import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import qrcode
+import qrcode.image.svg
 from flask import Blueprint, Flask, current_app, jsonify, render_template, request, send_file
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import links
 from config import Settings
 from jobs import JobManager
 from levels import LEVELS, get_level, level_name
-from music_api import NeteaseClient, NeteaseError
+from music_api import CookieStore, NeteaseClient, NeteaseError, qr_login_url
 from music_downloader import MusicDownloader
+from security import RateLimiter, apply_cors, apply_security_headers, is_authorized
 from storage import CacheStore
-from utils import format_size
+from tagging import ms_to_date
+from utils import TTLCache, format_size
 
 VERSION = "3.0.0"
 log = logging.getLogger("netease")
@@ -83,6 +92,22 @@ class Services:
     client: NeteaseClient
     downloader: MusicDownloader
     jobs: JobManager
+    cookies: CookieStore
+    limiter: RateLimiter
+    status_cache: TTLCache = field(default_factory=lambda: TTLCache(ttl=600, maxsize=4))
+
+
+# 不需要令牌的端点；会访问网易云接口的端点按 IP 限流
+PUBLIC_ENDPOINTS = {"api.index", "api.health", "static"}
+RATE_LIMITED = {
+    "api.song",
+    "api.search",
+    "api.playlist",
+    "api.album",
+    "api.download",
+    "api.create_job",
+    "api.login_qr",
+}
 
 
 def services() -> Services:
@@ -354,6 +379,9 @@ def api_info():
                 "/api/jobs/<id>": "GET - 查询下载进度",
                 "/api/files/<id>/<level>": "GET - 获取已下载的文件",
                 "/api/info": "GET - 服务信息",
+                "/api/status": "GET - 账号与缓存状态",
+                "/api/login/qr": "POST - 获取登录二维码",
+                "/api/login/qr/check": "GET - 查询扫码状态（成功后自动保存 cookie）",
             },
             "supported_qualities": [
                 {"key": lv.key, "name": lv.name, "description": lv.description}
@@ -363,6 +391,105 @@ def api_info():
         },
         "API信息获取成功",
     )
+
+
+# ============ 账号与扫码登录 ============
+
+
+def account_summary(client: NeteaseClient) -> dict[str, Any]:
+    acc = client.account()
+    if not acc["logged_in"]:
+        return {"logged_in": False}
+    vip = client.vip_info()
+    name, expire = "普通用户", None
+    for key, label in (
+        ("svip_expire", "黑胶SVIP"),
+        ("vip_expire", "黑胶VIP"),
+        ("music_package_expire", "音乐包"),
+    ):
+        if vip.get(key):
+            name, expire = label, vip[key]
+            break
+    return {
+        "logged_in": True,
+        "user_id": acc["user_id"],
+        "nickname": acc["nickname"],
+        "vip_name": name,
+        "expire_date": ms_to_date(expire) if expire else None,
+        "days_left": math.ceil((expire / 1000 - time.time()) / 86400) if expire else None,
+    }
+
+
+@bp.route("/api/status", methods=["GET"])
+def status():
+    svc = services()
+    cookies = svc.client.user_cookies()
+    warnings: list[str] = []
+    account: dict[str, Any] = {"logged_in": False}
+    if not cookies.get("MUSIC_U"):
+        warnings.append("cookie 中没有 MUSIC_U：请扫码登录，或在 cookie 文件中填写")
+    else:
+        try:
+            account = svc.status_cache.get_or_set("account", lambda: account_summary(svc.client))
+        except NeteaseError as e:
+            warnings.append(f"账号信息获取失败: {e.message}")
+        if not account.get("logged_in"):
+            warnings.append("cookie 已失效，请重新登录")
+    return ok(
+        {
+            "version": VERSION,
+            "account": account,
+            "cookie_configured": bool(cookies.get("MUSIC_U")),
+            "warnings": warnings,
+            "cache": svc.downloader.store.usage(),
+            "auth_enabled": bool(svc.settings.api_token),
+            "default_level": svc.settings.default_level,
+        }
+    )
+
+
+QR_STATUS = {
+    800: ("expired", "二维码已过期，请关闭后重新扫码"),
+    801: ("waiting", "等待扫码"),
+    802: ("scanned", "已扫码，请在手机上确认登录"),
+    803: ("success", "登录成功，cookie 已保存"),
+}
+
+
+@bp.route("/api/login/qr", methods=["POST"])
+def login_qr():
+    key = services().client.qr_unikey()
+    url = qr_login_url(key)
+    image = qrcode.make(url, image_factory=qrcode.image.svg.SvgPathImage, box_size=10)
+    return ok({"key": key, "qr_url": url, "qr_svg": image.to_string(encoding="unicode")})
+
+
+@bp.route("/api/login/qr/check", methods=["GET"])
+def login_qr_check():
+    key = str(request.args.get("key") or "").strip()
+    if not re.fullmatch(r"[\w-]{8,64}", key):
+        raise ApiError("参数 'key' 无效", 400, "INVALID_INPUT")
+    svc = services()
+    result = svc.client.qr_check(key)
+    code = result["code"]
+    state, message = QR_STATUS.get(code, ("error", result["message"] or f"登录失败（code={code}）"))
+    if code == 802 and result.get("nickname"):
+        message = f"{result['nickname']} 已扫码，请在手机上确认登录"
+    if code == 803:
+        if result["cookies"].get("MUSIC_U"):
+            save_login_cookies(svc.cookies, result["cookies"])
+            svc.status_cache.clear()
+        else:
+            state, message = "error", "登录成功但没有拿到 MUSIC_U"
+    return ok({"status": state, "code": code, "message": message})
+
+
+def save_login_cookies(store: CookieStore, new: dict[str, str]) -> None:
+    """保留原 cookie 中的其他字段（如自定义的 os/appver），旧文件备份为 .bak。"""
+    if store.path.exists():
+        shutil.copy2(store.path, store.path.with_name(store.path.name + ".bak"))
+    store.save({**store.get(), **new})
+    log.info("扫码登录成功，cookie 已写入 %s", store.path)
 
 
 # ============ 应用工厂 ============
@@ -392,14 +519,22 @@ def register_error_handlers(app: Flask) -> None:
         return fail("服务器内部错误", 500, "INTERNAL_ERROR")
 
 
-def setup_logging(settings: Settings) -> None:
+def setup_logging(settings: Settings, *, log_file: bool = False) -> None:
     logger = logging.getLogger("netease")
-    if logger.handlers:
-        return
     logger.setLevel(settings.log_level.upper())
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    logger.addHandler(handler)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    if log_file:
+        path = settings.data_dir / "logs" / "app.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
 
 def create_app(
@@ -411,7 +546,13 @@ def create_app(
 ) -> Flask:
     settings = settings or Settings.from_env()
     setup_logging(settings)
-    client = client or NeteaseClient.from_settings(settings)
+    cookies = CookieStore(settings.cookie_file)
+    client = client or NeteaseClient(
+        cookies,
+        os_name=settings.netease_os,
+        appver=settings.netease_appver,
+        device_id=settings.netease_device_id,
+    )
     if downloader is None:
         store = CacheStore(settings.cache_dir, settings.max_cache_bytes)
         removed = store.cleanup_parts()
@@ -419,22 +560,46 @@ def create_app(
             log.info("已清理 %d 个过期的下载临时文件", removed)
         downloader = MusicDownloader(client, store, settings)
     jobs = jobs or JobManager(downloader, settings.max_concurrent_downloads)
+    limiter = RateLimiter(settings.rate_limit_per_minute)
     app = Flask(__name__)
     app.json.ensure_ascii = False
-    app.extensions["netease"] = Services(settings, client, downloader, jobs)
+    if settings.trust_proxy:
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    app.extensions["netease"] = Services(settings, client, downloader, jobs, cookies, limiter)
     app.register_blueprint(bp)
     register_error_handlers(app)
 
     @app.before_request
-    def _log_request():
+    def _guard():
         log.info("%s %s - %s", request.method, request.path, request.remote_addr)
+        if request.method == "OPTIONS":
+            return None
+        if request.endpoint not in PUBLIC_ENDPOINTS and not is_authorized(
+            request, settings.api_token
+        ):
+            return fail("需要访问令牌（API_TOKEN）", 401, "UNAUTHORIZED")
+        if request.endpoint in RATE_LIMITED and not limiter.allow(request.remote_addr or "-"):
+            return fail("请求过于频繁，请稍后再试", 429, "RATE_LIMITED")
+        return None
+
+    @app.after_request
+    def _headers(response):
+        apply_cors(request, response, settings.cors_origins)
+        apply_security_headers(response)
+        return response
 
     return app
 
 
 def main() -> None:
     settings = Settings.from_env()
+    setup_logging(settings, log_file=True)
     app = create_app(settings)
+    if settings.host not in ("127.0.0.1", "localhost", "::1") and not settings.api_token:
+        log.warning(
+            "服务监听在 %s 且未设置 API_TOKEN，任何能访问该地址的人都能使用你的会员账号",
+            settings.host,
+        )
     log.info("服务地址: http://%s:%s", settings.host, settings.port)
     try:
         from waitress import serve

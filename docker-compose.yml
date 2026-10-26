@@ -1,11 +1,14 @@
 services:
   netease-url:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
+    image: netease-url:latest
     env_file:
       - path: .env
         required: false
     ports:
-      - "5000:5000"
+      # 默认只允许本机访问。需要局域网/公网访问时改成 "5000:5000"，并务必在 .env 中设置 API_TOKEN
+      - "127.0.0.1:5000:5000"
+    volumes:
+      # cookie.txt、下载缓存和日志都在这里；Linux 上请先执行 mkdir -p data && chown 1000:1000 data
+      - ./data:/app/data
     restart: unless-stopped
