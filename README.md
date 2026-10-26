@@ -44,8 +44,12 @@
 ```bash
 git clone https://github.com/KingCrimsonJY/Netease_url.git
 cd Netease_url
+python -m venv .venv
+# Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
 pip install -r requirements.lock
 ```
+
+之后每次运行前先激活虚拟环境，或直接用 `.venv\Scripts\python main.py`（Linux/macOS 为 `.venv/bin/python main.py`）。直接用系统 Python 运行会报 `No module named 'pathvalidate'` 之类的错误。
 
 ### 配置 cookie
 
