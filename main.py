@@ -522,6 +522,7 @@ def register_error_handlers(app: Flask) -> None:
 def setup_logging(settings: Settings, *, log_file: bool = False) -> None:
     logger = logging.getLogger("netease")
     logger.setLevel(settings.log_level.upper())
+    logger.propagate = False  # waitress 会给根 logger 配置输出，避免每条日志打印两遍
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     if not logger.handlers:
         handler = logging.StreamHandler()
