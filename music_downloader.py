@@ -1,8 +1,7 @@
 """网易云音乐下载器（适配 ffmpeg 写入元数据）
 
 提供功能：
-- 同步 / 异步下载（本地落盘 / 内存返回）
-- 批量并发下载
+- 同步下载（本地落盘 / 内存返回）
 - 进度查询
 - 基于 ffmpeg 的元数据 + 封面写入（MP3/FLAC/M4A/MP4/OGG/Opus）
 
@@ -15,7 +14,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import shutil
@@ -25,19 +23,18 @@ from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-import aiofiles
-import aiohttp
 import requests
 
 from music_api import APIException, NeteaseAPI, load_cookies
 
-
 # ============ 类型定义 ============
+
 
 class AudioFormat(Enum):
     """音频格式枚举"""
+
     MP3 = "mp3"
     FLAC = "flac"
     M4A = "m4a"
@@ -47,6 +44,7 @@ class AudioFormat(Enum):
 
 class QualityLevel(Enum):
     """音质等级枚举"""
+
     STANDARD = "standard"
     EXHIGH = "exhigh"
     LOSSLESS = "lossless"
@@ -60,6 +58,7 @@ class QualityLevel(Enum):
 @dataclass
 class MusicInfo:
     """音乐信息数据类"""
+
     id: int
     name: str
     artists: str
@@ -78,15 +77,17 @@ class MusicInfo:
 @dataclass
 class DownloadResult:
     """下载结果数据类"""
+
     success: bool
-    file_path: Optional[str] = None
+    file_path: str | None = None
     file_size: int = 0
     error_message: str = ""
-    music_info: Optional[MusicInfo] = None
+    music_info: MusicInfo | None = None
 
 
 class DownloadException(Exception):
     """下载异常类"""
+
     pass
 
 
@@ -118,6 +119,7 @@ METADATA_FORMATS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus"}
 
 # ============ 核心实现 ============
 
+
 class MusicDownloader:
     """网易云音乐下载器
 
@@ -130,7 +132,7 @@ class MusicDownloader:
         self,
         download_dir: str = "downloads",
         max_concurrent: int = 3,
-        ffmpeg_path: Optional[str] = None,
+        ffmpeg_path: str | None = None,
     ):
         """
         Args:
@@ -153,8 +155,8 @@ class MusicDownloader:
 
     def _sanitize_filename(self, filename: str) -> str:
         """清理文件名非法字符"""
-        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        filename = filename.strip(' .')
+        filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
+        filename = filename.strip(" .")
         if len(filename) > 200:
             filename = filename[:200]
         return filename or "unknown"
@@ -191,7 +193,7 @@ class MusicDownloader:
 
         return ".mp3"
 
-    def _resolve_ffmpeg(self) -> Optional[str]:
+    def _resolve_ffmpeg(self) -> str | None:
         """懒加载解析 ffmpeg 路径
 
         每次写入前调用一次：若启动时未检测到，但中途已安装，下一次就能用。
@@ -311,56 +313,13 @@ class MusicDownloader:
         except Exception as e:
             return DownloadResult(success=False, error_message=f"下载过程中发生错误: {e}")
 
-    # ----------- 下载（异步） -----------
-
-    async def download_music_file_async(
-        self,
-        music_id: int,
-        quality: str = "standard",
-    ) -> DownloadResult:
-        """异步下载音乐到本地"""
-        try:
-            music_info = self.get_music_info(music_id, quality)
-            file_path = self._build_file_path(music_info)
-
-            if file_path.exists():
-                return DownloadResult(
-                    success=True,
-                    file_path=str(file_path),
-                    file_size=file_path.stat().st_size,
-                    music_info=music_info,
-                )
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(music_info.download_url) as resp:
-                    resp.raise_for_status()
-                    async with aiofiles.open(file_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(8192):
-                            await f.write(chunk)
-
-            self._write_metadata_with_ffmpeg(file_path, music_info)
-
-            return DownloadResult(
-                success=True,
-                file_path=str(file_path),
-                file_size=file_path.stat().st_size,
-                music_info=music_info,
-            )
-
-        except DownloadException:
-            raise
-        except aiohttp.ClientError as e:
-            return DownloadResult(success=False, error_message=f"异步下载请求失败: {e}")
-        except Exception as e:
-            return DownloadResult(success=False, error_message=f"异步下载过程中发生错误: {e}")
-
     # ----------- 下载到内存 -----------
 
     def download_music_to_memory(
         self,
         music_id: int,
         quality: str = "standard",
-    ) -> Tuple[bool, BytesIO, MusicInfo]:
+    ) -> tuple[bool, BytesIO, MusicInfo]:
         """下载音乐到内存"""
         try:
             music_info = self.get_music_info(music_id, quality)
@@ -375,41 +334,13 @@ class MusicDownloader:
         except Exception as e:
             raise DownloadException(f"内存下载过程中发生错误: {e}")
 
-    # ----------- 批量下载 -----------
-
-    async def download_batch_async(
-        self,
-        music_ids: List[int],
-        quality: str = "standard",
-    ) -> List[DownloadResult]:
-        """批量并发下载"""
-        semaphore = asyncio.Semaphore(self.max_concurrent)
-
-        async def _one(music_id: int) -> DownloadResult:
-            async with semaphore:
-                return await self.download_music_file_async(music_id, quality)
-
-        tasks = [_one(mid) for mid in music_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        processed: List[DownloadResult] = []
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                processed.append(DownloadResult(
-                    success=False,
-                    error_message=f"下载音乐ID {music_ids[i]} 时发生异常: {r}",
-                ))
-            else:
-                processed.append(r)
-        return processed
-
     # ----------- 进度查询 -----------
 
     def get_download_progress(
         self,
         music_id: int,
         quality: str = "standard",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """查询下载进度"""
         try:
             music_info = self.get_music_info(music_id, quality)
@@ -418,9 +349,7 @@ class MusicDownloader:
             if file_path.exists():
                 current_size = file_path.stat().st_size
                 progress = (
-                    current_size / music_info.file_size * 100
-                    if music_info.file_size > 0
-                    else 0
+                    current_size / music_info.file_size * 100 if music_info.file_size > 0 else 0
                 )
                 return {
                     "music_id": music_id,
@@ -478,11 +407,9 @@ class MusicDownloader:
 
         # 临时输出文件：保留原扩展名在最后，便于 ffmpeg 识别 muxer
         # 例: 艾辰 - 错位时空.tagging.flac
-        tmp_output = file_path.with_name(
-            file_path.stem + ".tagging" + file_path.suffix
-        )
+        tmp_output = file_path.with_name(file_path.stem + ".tagging" + file_path.suffix)
         # 临时封面文件
-        cover_tmp: Optional[str] = None
+        cover_tmp: str | None = None
 
         try:
             # 下载封面到临时文件
@@ -501,9 +428,13 @@ class MusicDownloader:
             # 构造 ffmpeg 命令
             # 顺序: global opts -> -i input1 -> -i input2 -> metadata -> mapping -> -f format -> output
             output_format = EXT_TO_FFMPEG_FORMAT.get(file_ext, "")
-            cmd: List[str] = [
-                ffmpeg_path, "-y", "-loglevel", "error",
-                "-i", str(file_path),
+            cmd: list[str] = [
+                ffmpeg_path,
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(file_path),
             ]
             if cover_tmp:
                 cmd += ["-i", cover_tmp]
@@ -546,10 +477,7 @@ class MusicDownloader:
                 shutil.move(str(tmp_output), str(file_path))
                 return True
 
-            print(
-                f"ffmpeg 写入元数据失败: "
-                f"{(result.stderr or result.stdout or '').strip()}"
-            )
+            print(f"ffmpeg 写入元数据失败: {(result.stderr or result.stdout or '').strip()}")
             return False
 
         except subprocess.TimeoutExpired:
@@ -575,17 +503,26 @@ class MusicDownloader:
                 except OSError:
                     pass
 
-    def _build_format_args(self, file_ext: str, has_cover: bool) -> List[str]:
+    def _build_format_args(self, file_ext: str, has_cover: bool) -> list[str]:
         """根据文件格式构造 mapping / 编码参数"""
         if file_ext == ".mp3":
             # MP3: 封面通过 ID3v2 APIC 帧写入
             if has_cover:
                 return [
-                    "-map", "0:a", "-map", "1:v",
-                    "-c:a", "copy", "-c:v", "copy",
-                    "-id3v2_version", "3",
-                    "-metadata:s:v", "title=Album cover",
-                    "-metadata:s:v", "comment=Cover (front)",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:v",
+                    "-c:a",
+                    "copy",
+                    "-c:v",
+                    "copy",
+                    "-id3v2_version",
+                    "3",
+                    "-metadata:s:v",
+                    "title=Album cover",
+                    "-metadata:s:v",
+                    "comment=Cover (front)",
                 ]
             return ["-map", "0:a", "-c:a", "copy", "-id3v2_version", "3"]
 
@@ -593,9 +530,14 @@ class MusicDownloader:
             # FLAC: 原生支持封面
             if has_cover:
                 return [
-                    "-map", "0", "-map", "1",
-                    "-c", "copy",
-                    "-disposition:v:0", "attached_pic",
+                    "-map",
+                    "0",
+                    "-map",
+                    "1",
+                    "-c",
+                    "copy",
+                    "-disposition:v:0",
+                    "attached_pic",
                 ]
             return ["-map", "0", "-c", "copy"]
 
@@ -603,11 +545,18 @@ class MusicDownloader:
             # M4A: AAC 音频 + mp4 容器
             if has_cover:
                 return [
-                    "-map", "0:a", "-map", "1:v",
-                    "-c", "copy",
-                    "-disposition:v:0", "attached_pic",
-                    "-metadata:s:v", "title=Album cover",
-                    "-metadata:s:v", "comment=Cover (front)",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:v",
+                    "-c",
+                    "copy",
+                    "-disposition:v:0",
+                    "attached_pic",
+                    "-metadata:s:v",
+                    "title=Album cover",
+                    "-metadata:s:v",
+                    "comment=Cover (front)",
                 ]
             return ["-map", "0:a", "-c:a", "copy"]
 
@@ -616,20 +565,34 @@ class MusicDownloader:
             # 杜比文件通常无视频流，封面作为 video stream 注入；+faststart 让 moov 在文件头
             if has_cover:
                 return [
-                    "-map", "0", "-map", "1:v",
-                    "-c", "copy",
-                    "-disposition:v:0", "attached_pic",
-                    "-metadata:s:v", "title=Album cover",
-                    "-metadata:s:v", "comment=Cover (front)",
-                    "-movflags", "+faststart",
+                    "-map",
+                    "0",
+                    "-map",
+                    "1:v",
+                    "-c",
+                    "copy",
+                    "-disposition:v:0",
+                    "attached_pic",
+                    "-metadata:s:v",
+                    "title=Album cover",
+                    "-metadata:s:v",
+                    "comment=Cover (front)",
+                    "-movflags",
+                    "+faststart",
                 ]
             return ["-map", "0", "-c", "copy", "-movflags", "+faststart"]
 
         if file_ext in (".ogg", ".opus"):
             if has_cover:
                 return [
-                    "-map", "0:a", "-map", "1:v",
-                    "-c:a", "copy", "-c:v", "copy",
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:v",
+                    "-c:a",
+                    "copy",
+                    "-c:v",
+                    "copy",
                 ]
             return ["-map", "0:a", "-c:a", "copy"]
 
@@ -651,8 +614,10 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("网易云音乐下载器")
         print(f"ffmpeg 路径: {downloader.ffmpeg_path or '未找到'}")
-        print("支持的音质: standard / exhigh / lossless / hires / sky / jyeffect / jymaster / dolby")
-        print("支持的功能: 同步/异步/批量下载、内存下载、进度查询、ffmpeg 元数据写入")
+        print(
+            "支持的音质: standard / exhigh / lossless / hires / sky / jyeffect / jymaster / dolby"
+        )
+        print("支持的功能: 同步下载、内存下载、进度查询、ffmpeg 元数据写入")
         print()
         print("用法:")
         print("  python music_downloader.py <music_id> [quality]            # 仅打印信息")

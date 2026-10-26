@@ -7,17 +7,15 @@
 - 用户友好的交互界面
 """
 
-import os
+import datetime
+import logging
+import shutil
 import sys
 import time
-import shutil
-import logging
-import datetime
 from pathlib import Path
-from typing import Optional, Tuple
 
 try:
-    from music_api import QRLoginManager, APIException, load_cookies
+    from music_api import APIException, QRLoginManager, load_cookies
 except ImportError as e:
     print(f"导入模块失败: {e}")
     print("请确保 music_api.py 文件存在且可用")
@@ -42,7 +40,7 @@ class QRLoginClient:
 
         if not self.logger.handlers:
             handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
@@ -69,7 +67,7 @@ class QRLoginClient:
             self.logger.error(f"写入 Cookie 失败: {e}")
             return False
 
-    def _backup_cookie(self, suffix: str = "backup") -> Optional[Path]:
+    def _backup_cookie(self, suffix: str = "backup") -> Path | None:
         if not self.cookie_file.exists():
             return None
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -111,7 +109,9 @@ class QRLoginClient:
         if self.cookie_file.exists():
             try:
                 mtime = self.cookie_file.stat().st_mtime
-                info["last_modified"] = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                info["last_modified"] = datetime.datetime.fromtimestamp(mtime).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             except OSError:
                 pass
         return info
@@ -130,14 +130,14 @@ class QRLoginClient:
             self.logger.error(f"检查登录状态失败: {e}")
             return False
 
-    def interactive_login(self) -> Tuple[bool, Optional[str]]:
+    def interactive_login(self) -> tuple[bool, str | None]:
         """交互式二维码登录"""
         try:
             print("\n=== 网易云音乐二维码登录 ===")
 
             if self.check_existing_login():
                 choice = input("检测到已有有效登录，是否重新登录？(y/N): ").strip().lower()
-                if choice not in ('y', 'yes', '是'):
+                if choice not in ("y", "yes", "是"):
                     print("使用现有登录状态")
                     return True, None
 
@@ -145,12 +145,12 @@ class QRLoginClient:
             print("正在生成二维码...")
             qr_result = self.qr_manager.create_qr_login()
 
-            if not qr_result.get('success'):
+            if not qr_result.get("success"):
                 error_msg = f"生成二维码失败: {qr_result.get('message', '未知错误')}"
                 self.logger.error(error_msg)
                 return False, error_msg
 
-            qr_key = qr_result['qr_key']
+            qr_key = qr_result["qr_key"]
             print("\n二维码已生成！")
             print("请使用网易云音乐手机 APP 扫描二维码进行登录")
             print("二维码有效期: 3 分钟")
@@ -162,10 +162,10 @@ class QRLoginClient:
                 try:
                     status_result = self.qr_manager.check_qr_login(qr_key)
 
-                    if status_result.get('success'):
-                        status = status_result.get('status')
-                        if status == 'success':
-                            cookie = status_result.get('cookie', '')
+                    if status_result.get("success"):
+                        status = status_result.get("status")
+                        if status == "success":
+                            cookie = status_result.get("cookie", "")
                             if not cookie:
                                 return False, "登录成功但未获取到 Cookie"
                             if self.save_cookie(cookie):
@@ -173,19 +173,21 @@ class QRLoginClient:
                                 return True, None
                             return False, "登录成功但 Cookie 保存失败"
 
-                        if status == 'waiting' and attempt % 10 == 0:
+                        if status == "waiting" and attempt % 10 == 0:
                             print(f"等待扫码中... ({attempt + 1}/{max_attempts})")
-                        elif status == 'scanned':
+                        elif status == "scanned":
                             print("二维码已扫描，请在手机上确认登录")
-                        elif status == 'expired':
+                        elif status == "expired":
                             print("\n❌ 二维码已过期，请重新尝试")
                             return False, "二维码已过期"
-                        elif status == 'error':
-                            msg = status_result.get('message', '未知错误')
+                        elif status == "error":
+                            msg = status_result.get("message", "未知错误")
                             print(f"\n❌ 登录失败: {msg}")
                             return False, f"登录失败: {msg}"
                     else:
-                        self.logger.warning(f"检查登录状态失败: {status_result.get('message', '未知错误')}")
+                        self.logger.warning(
+                            f"检查登录状态失败: {status_result.get('message', '未知错误')}"
+                        )
 
                     time.sleep(5)
                     attempt += 1
@@ -269,8 +271,7 @@ class QRLoginClient:
 
 def main():
     logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
     client = QRLoginClient()
@@ -278,7 +279,7 @@ def main():
     if len(sys.argv) > 1:
         command = sys.argv[1].lower()
 
-        if command == 'login':
+        if command == "login":
             success, error = client.interactive_login()
             if success:
                 print("\n登录完成！")
@@ -287,14 +288,14 @@ def main():
             print(f"\n登录失败: {error}")
             sys.exit(1)
 
-        elif command in ('status', 'info'):
+        elif command in ("status", "info"):
             client.show_login_info()
             sys.exit(0)
 
-        elif command == 'logout':
+        elif command == "logout":
             sys.exit(0 if client.logout() else 1)
 
-        elif command in ('help', '-h', '--help'):
+        elif command in ("help", "-h", "--help"):
             print("网易云音乐二维码登录工具")
             print("\n用法: python qr_login.py [命令]")
             print("\n命令:")
@@ -321,18 +322,18 @@ def main():
 
             choice = input("\n请选择操作 (1-4): ").strip()
 
-            if choice == '1':
+            if choice == "1":
                 success, error = client.interactive_login()
                 if success:
                     print("\n登录成功！")
                     client.show_login_info()
                 else:
                     print(f"\n登录失败: {error}")
-            elif choice == '2':
+            elif choice == "2":
                 client.show_login_info()
-            elif choice == '3':
+            elif choice == "3":
                 client.logout()
-            elif choice == '4':
+            elif choice == "4":
                 print("再见！")
                 break
             else:

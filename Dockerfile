@@ -1,9 +1,9 @@
-FROM python:3.9.22-alpine3.21
+FROM python:3.12-slim
 WORKDIR /app
-RUN apk add --no-cache ffmpeg
-COPY requirements.txt requirements.txt
-RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
-    pip3 install --no-cache-dir -r requirements.txt
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+COPY requirements.lock requirements.lock
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r requirements.lock
 COPY . .
 RUN chmod +x /app/entrypoint.sh
 ENV TZ=Asia/Shanghai

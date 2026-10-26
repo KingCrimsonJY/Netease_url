@@ -1,0 +1,29 @@
+[project]
+name = "netease-url"
+version = "3.0.0"
+description = "网易云音乐解析与下载服务"
+requires-python = ">=3.12"
+license = "MIT"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# 旧代码，重写后删除
+"main.py" = ["F401", "F841"]
+"music_api.py" = ["B904"]
+"music_downloader.py" = ["B904"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = [
+    "live: 需要真实 cookie、访问网易云接口的在线测试（NETEASE_COOKIE 或 NETEASE_COOKIE_FILE）",
+]
