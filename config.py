@@ -69,7 +69,7 @@ class Settings:
     cover_size: int = 1200
     lyrics_mode: str = "embed"
     lyrics_translation: str = "merge"
-    id3_version: int = 3
+    id3_version: int = 4
 
     # 文件名
     filename_template: str = "{artists} - {title}"

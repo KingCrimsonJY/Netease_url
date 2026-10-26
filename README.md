@@ -88,7 +88,7 @@ python music_downloader.py batch songs.txt --level exhigh --out Music --workers 
 - 默认文件名：`歌手 - 歌名.扩展名`。多位歌手用 `, ` 分隔，超过 3 位时显示前 3 位加"等"
 - 模板变量：`{artists}` `{artist}` `{title}` `{album}` `{track:02d}` `{disc}` `{year}` `{level}` `{quality_name}` `{id}`
 - `/ \ : * ? " < > |` 替换为对应全角字符（`FULLWIDTH_REPLACE=false` 改为 `_`）；Windows 保留名（CON 等）会自动处理；主文件名不超过 180 字节
-- 标签字段：FLAC 使用 Vorbis 注释（多位艺人分别写入），MP3 使用 ID3v2.3（多值以 `/` 分隔，`ID3_VERSION=4` 可改为 v2.4），M4A 使用 iTunes 标准字段。另外写入 `NETEASE_SONG_ID`，用来判断同名文件是否为同一首歌
+- 标签字段：FLAC 使用 Vorbis 注释（多位艺人分别写入），MP3 使用 ID3v2.4（多位艺人分开存储；需要兼容很老的设备时可设 `ID3_VERSION=3`，但 v2.3 只能用 `/` 连接多位艺人，AC/DC 这类名字会被拆开），M4A 使用 iTunes 标准字段。另外写入 `NETEASE_SONG_ID`，用来判断同名文件是否为同一首歌
 - 封面类型为"封面（正面）"，默认 1200×1200 JPEG（约 300KB）
 
 ## 缓存

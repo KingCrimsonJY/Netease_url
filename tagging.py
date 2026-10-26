@@ -37,7 +37,7 @@ from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 import lyrics as lyrics_mod
 
 # 标签方案的版本号；修改写入规则后递增，已缓存的文件会在下次使用时重写标签
-TAG_VERSION = 1
+TAG_VERSION = 2  # 2: MP3 默认改为 ID3v2.4
 SONG_ID_KEY = "NETEASE_SONG_ID"
 _CST = timezone(timedelta(hours=8))
 _CJK = re.compile(r"[぀-ヿ㐀-鿿가-힯]")

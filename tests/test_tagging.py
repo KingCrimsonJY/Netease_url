@@ -130,3 +130,12 @@ def test_cover_helpers():
     assert detect_image_mime(JPEG) == "image/jpeg"
     assert detect_image_mime(b"\x89PNG\r\n\x1a\nxxxx") == "image/png"
     assert detect_image_mime(b"<html>") is None
+
+
+def test_mp3_id3v24_keeps_slash_in_artist_names(tmp_path):
+    song = {**SONG, "ar": [{"name": "AC/DC"}, {"name": "Guest"}]}
+    path = copy_fixture(tmp_path, "silence.mp3")
+    write_tags(path, build_tags(song, ALBUM, LRC, None), id3_version=4)
+    id3 = ID3(path)
+    assert id3.version[:2] == (2, 4)
+    assert id3["TPE1"].text == ["AC/DC", "Guest"]
