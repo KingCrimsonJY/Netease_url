@@ -17,9 +17,10 @@ from flask import Blueprint, Flask, current_app, jsonify, render_template, reque
 
 import links
 from config import Settings
+from jobs import JobManager
 from levels import LEVELS, get_level, level_name
 from music_api import NeteaseClient, NeteaseError
-from music_downloader import DownloadError, MusicDownloader
+from music_downloader import MusicDownloader
 from storage import CacheStore
 from utils import format_size
 
@@ -72,6 +73,7 @@ ERROR_STATUS = {
     "UPSTREAM_ERROR": 502,
     "DOWNLOAD_FAILED": 502,
     "CHECKSUM_MISMATCH": 502,
+    "INTERNAL_ERROR": 500,
 }
 
 
@@ -80,6 +82,7 @@ class Services:
     settings: Settings
     client: NeteaseClient
     downloader: MusicDownloader
+    jobs: JobManager
 
 
 def services() -> Services:
@@ -279,17 +282,42 @@ def download():
     return_format = data.get("format") or "file"
     if return_format not in ("file", "json"):
         raise ApiError("返回格式只支持 'file' 或 'json'", 400, "INVALID_INPUT")
-    result = run_download(song_id, level, strict=bool_param(data, "strict"))
+    job = services().jobs.submit(song_id, level, strict=bool_param(data, "strict"))
+    if not job.finished.wait(services().settings.sync_download_timeout):
+        raise ApiError("下载仍在进行，请稍后用同样的参数重试", 504, "TIMEOUT", data=job.to_dict())
+    if job.status == "failed":
+        raise ApiError(job.error, ERROR_STATUS.get(job.error_code, 502), job.error_code)
+    result = job.result
     if return_format == "json":
         return ok(result.to_dict(), "下载完成")
     return send_audio(result.entry.path, result.filename)
 
 
-def run_download(song_id: int, level: str, *, strict: bool = False):
-    try:
-        return services().downloader.download(song_id, level, strict=strict)
-    except DownloadError as e:
-        raise ApiError(e.message, ERROR_STATUS.get(e.code, 502), e.code) from e
+@bp.route("/api/jobs", methods=["POST"])
+def create_job():
+    data = params()
+    song_id = target_param(data, "song")
+    level = level_param(data, "level", "quality")
+    job = services().jobs.submit(song_id, level, strict=bool_param(data, "strict"))
+    return ok(job.to_dict(), "已加入下载队列", 202)
+
+
+@bp.route("/api/jobs/<job_id>", methods=["GET"])
+def get_job(job_id: str):
+    job = services().jobs.get(job_id)
+    if job is None:
+        raise ApiError("下载任务不存在或已过期", 404, "NOT_FOUND")
+    return ok(job.to_dict())
+
+
+@bp.route("/api/files/<int:song_id>/<level>", methods=["GET"])
+def get_file(song_id: int, level: str):
+    downloader = services().downloader
+    entry = downloader.store.find(song_id, level)
+    if entry is None:
+        raise ApiError("文件不在缓存中，请先创建下载任务", 404, "NOT_FOUND")
+    downloader.store.touch(entry)
+    return send_audio(entry.path, downloader.display_name(entry))
 
 
 AUDIO_MIME = {".mp3": "audio/mpeg", ".flac": "audio/flac", ".m4a": "audio/mp4", ".ogg": "audio/ogg"}
@@ -321,7 +349,10 @@ def api_info():
                 "/search": "GET/POST - 搜索（type=1|10|100|1000）",
                 "/playlist": "GET/POST - 歌单详情",
                 "/album": "GET/POST - 专辑详情",
-                "/download": "GET/POST - 下载（format=file|json）",
+                "/download": "GET/POST - 下载（format=file|json），同步等待完成",
+                "/api/jobs": "POST - 创建下载任务（异步）",
+                "/api/jobs/<id>": "GET - 查询下载进度",
+                "/api/files/<id>/<level>": "GET - 获取已下载的文件",
                 "/api/info": "GET - 服务信息",
             },
             "supported_qualities": [
@@ -376,6 +407,7 @@ def create_app(
     *,
     client: NeteaseClient | None = None,
     downloader: MusicDownloader | None = None,
+    jobs: JobManager | None = None,
 ) -> Flask:
     settings = settings or Settings.from_env()
     setup_logging(settings)
@@ -386,9 +418,10 @@ def create_app(
         if removed:
             log.info("已清理 %d 个过期的下载临时文件", removed)
         downloader = MusicDownloader(client, store, settings)
+    jobs = jobs or JobManager(downloader, settings.max_concurrent_downloads)
     app = Flask(__name__)
     app.json.ensure_ascii = False
-    app.extensions["netease"] = Services(settings, client, downloader)
+    app.extensions["netease"] = Services(settings, client, downloader, jobs)
     app.register_blueprint(bp)
     register_error_handlers(app)
 
