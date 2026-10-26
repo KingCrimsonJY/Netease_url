@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -16,6 +15,7 @@ from urllib.parse import quote
 
 from flask import Blueprint, Flask, current_app, jsonify, render_template, request, send_file
 
+import links
 from config import Settings
 from levels import LEVELS, get_level, level_name
 from music_api import NeteaseClient, NeteaseError
@@ -98,15 +98,17 @@ def params() -> dict[str, Any]:
     return data
 
 
-def song_id_param(data: dict[str, Any]) -> int:
-    raw = str(data.get("ids") or data.get("id") or data.get("url") or "").strip()
-    if not raw:
-        raise ApiError("必须提供 'ids'、'id' 或 'url' 参数", 400, "INVALID_INPUT")
-    m = re.search(r"[?&]id=(\d+)", raw) if "music.163.com" in raw else None
-    value = m.group(1) if m else raw
-    if not re.fullmatch(r"\d{1,20}", value):
-        raise ApiError(f"无法识别的歌曲 ID 或链接: {raw[:80]}", 400, "INVALID_INPUT")
-    return int(value)
+def target_param(data: dict[str, Any], kind: str, *keys: str) -> int:
+    """从参数里取出 ID 或链接并解析，返回对应类型的 ID。"""
+    keys = keys or ("id", "url")
+    raw = next((data[k] for k in keys if data.get(k) not in (None, "")), None)
+    if raw is None:
+        names = "、".join(f"'{k}'" for k in keys)
+        raise ApiError(f"必须提供 {names} 参数", 400, "INVALID_INPUT")
+    try:
+        return links.parse(raw, kind).id
+    except links.LinkError as e:
+        raise ApiError(str(e), 400, "INVALID_INPUT") from None
 
 
 def level_param(data: dict[str, Any], *keys: str) -> str:
@@ -155,7 +157,7 @@ def health():
 @bp.route("/Song_V1", methods=["GET", "POST"])
 def song():
     data = params()
-    song_id = song_id_param(data)
+    song_id = target_param(data, "song", "ids", "id", "url")
     level = level_param(data, "level", "quality")
     info_type = data.get("type") or "url"
     if info_type not in ("url", "name", "lyric", "json"):
@@ -253,7 +255,7 @@ def search():
 @bp.route("/Playlist", methods=["GET", "POST"])
 def playlist():
     data = params()
-    playlist_id = song_id_param({"id": data.get("id") or data.get("url")})
+    playlist_id = target_param(data, "playlist")
     offset = int_param(data, "offset", 0, 0)
     limit = int_param(data, "limit", 0, 0) or None
     result = services().client.playlist(playlist_id, offset=offset, limit=limit)
@@ -264,7 +266,7 @@ def playlist():
 @bp.route("/Album", methods=["GET", "POST"])
 def album():
     data = params()
-    album_id = song_id_param({"id": data.get("id") or data.get("url")})
+    album_id = target_param(data, "album")
     return ok({"status": 200, "album": services().client.album(album_id)}, "获取专辑详情成功")
 
 
@@ -272,7 +274,7 @@ def album():
 @bp.route("/Download", methods=["GET", "POST"])
 def download():
     data = params()
-    song_id = song_id_param(data)
+    song_id = target_param(data, "song")
     level = level_param(data, "quality", "level")
     return_format = data.get("format") or "file"
     if return_format not in ("file", "json"):

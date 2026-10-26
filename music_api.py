@@ -316,6 +316,7 @@ class NeteaseClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self._album_cache = TTLCache(ttl=600, maxsize=256)
+        self._playlist_cache = TTLCache(ttl=300, maxsize=32)
 
     @classmethod
     def from_settings(cls, settings) -> NeteaseClient:
@@ -530,8 +531,12 @@ class NeteaseClient:
     def playlist(
         self, playlist_id: int, *, offset: int = 0, limit: int | None = None
     ) -> dict[str, Any]:
-        raw = self.api(
-            f"{WEB_BASE}/api/v6/playlist/detail", {"id": int(playlist_id), "n": 100000, "s": 8}
+        # 歌单详情缓存 5 分钟，分页浏览大歌单时不必每页都重新获取 trackIds
+        raw = self._playlist_cache.get_or_set(
+            int(playlist_id),
+            lambda: self.api(
+                f"{WEB_BASE}/api/v6/playlist/detail", {"id": int(playlist_id), "n": 100000, "s": 8}
+            ),
         )
         pl = raw.get("playlist") or {}
         track_ids = [t["id"] for t in pl.get("trackIds") or []]

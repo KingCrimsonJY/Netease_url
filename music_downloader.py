@@ -26,6 +26,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import links
 import lyrics as lyrics_mod
 from config import Settings
 from levels import level_name
@@ -395,9 +396,12 @@ class MusicDownloader:
 
 
 def _parse_song_id(text: str) -> int | None:
-    text = text.strip()
-    m = re.search(r"[?&]id=(\d+)", text) or re.fullmatch(r"\D*?(\d{1,20})\D*", text)
-    return int(m.group(1)) if m else None
+    """歌曲 ID、链接或分享文本；兼容 "10825点" 这类只含一个数字的行。"""
+    try:
+        return links.parse(text, "song").id
+    except links.LinkError:
+        m = re.fullmatch(r"\D*?(\d{1,20})\D*", text.strip())
+        return int(m.group(1)) if m and "music.163.com" not in text else None
 
 
 def _build(settings: Settings) -> MusicDownloader:
