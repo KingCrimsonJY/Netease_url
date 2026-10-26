@@ -1,669 +1,526 @@
-"""网易云音乐下载器（适配 ffmpeg 写入元数据）
+"""下载流程：获取链接 → 查缓存 → 下载（断点续传、md5 校验）→ 写标签 → 原子提交 → 容量控制。
 
-提供功能：
-- 同步下载（本地落盘 / 内存返回）
-- 进度查询
-- 基于 ffmpeg 的元数据 + 封面写入（MP3/FLAC/M4A/MP4/OGG/Opus）
-
-设计要点：
-1. ffmpeg 路径懒加载：每次写入前重新检测，支持服务启动后中途安装
-2. 显式 -f 指定输出格式 + 临时文件保留原扩展名在最后，双保险
-3. MP4（杜比全景声 EAC3）单独分支，启用 +faststart
-4. 扩展名优先使用 API 返回的 type 字段，URL/Content-Type 兜底
+命令行：
+    python music_downloader.py info 1901371647 --level jymaster
+    python music_downloader.py download 1901371647 --level lossless --out Music
+    python music_downloader.py batch songs.txt --level exhigh --out Music --workers 5
 """
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import logging
 import os
 import re
 import shutil
-import subprocess
-import tempfile
-from dataclasses import dataclass
-from enum import Enum
-from io import BytesIO
+import sys
+import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from music_api import CookieStore, NeteaseClient, NeteaseError
+import lyrics as lyrics_mod
+from config import Settings
+from levels import level_name
+from music_api import USER_AGENT, NeteaseClient, NeteaseError, TrackSource
+from naming import build_filename
+from storage import CacheEntry, CacheStore
+from tagging import (
+    EXT_BY_FORMAT,
+    TAG_VERSION,
+    TaggingError,
+    build_tags,
+    fetch_cover,
+    read_song_id,
+    sniff_format,
+    write_tags,
+)
+from utils import atomic_write_text, format_size
 
-# ============ 类型定义 ============
+log = logging.getLogger("netease.downloader")
+
+ProgressCallback = Callable[[str, int, int], None]  # (阶段, 已完成字节, 总字节)
+MAX_TAG_ATTEMPTS = 3
+CHUNK = 256 * 1024
+
+DOWNLOAD_ERRORS = {
+    "CHECKSUM_MISMATCH": "下载的文件 md5 校验失败",
+    "DOWNLOAD_FAILED": "下载失败",
+    "QUALITY_DOWNGRADED": "实际音质与请求的不一致",
+}
 
 
-class AudioFormat(Enum):
-    """音频格式枚举"""
-
-    MP3 = "mp3"
-    FLAC = "flac"
-    M4A = "m4a"
-    MP4 = "mp4"
-    UNKNOWN = "unknown"
+class DownloadError(Exception):
+    def __init__(self, code: str, message: str | None = None):
+        self.code = code
+        self.message = message or DOWNLOAD_ERRORS.get(code, code)
+        super().__init__(self.message)
 
 
-class QualityLevel(Enum):
-    """音质等级枚举"""
-
-    STANDARD = "standard"
-    EXHIGH = "exhigh"
-    LOSSLESS = "lossless"
-    HIRES = "hires"
-    SKY = "sky"
-    JYEFFECT = "jyeffect"
-    JYMASTER = "jymaster"
-    DOLBY = "dolby"
-
-
-@dataclass
-class MusicInfo:
-    """音乐信息数据类"""
-
-    id: int
-    name: str
-    artists: str
-    album: str
-    pic_url: str
-    duration: int
-    track_number: int
-    download_url: str
-    file_type: str
-    file_size: int
-    quality: str
-    lyric: str = ""
-    tlyric: str = ""
+DownloadException = DownloadError  # 兼容旧名称
 
 
 @dataclass
 class DownloadResult:
-    """下载结果数据类"""
+    entry: CacheEntry
+    source: TrackSource
+    cached: bool
+    filename: str
+    warnings: list[str] = field(default_factory=list)
 
-    success: bool
-    file_path: str | None = None
-    file_size: int = 0
-    error_message: str = ""
-    music_info: MusicInfo | None = None
+    @property
+    def path(self) -> Path:
+        return self.entry.path
 
-
-class DownloadException(Exception):
-    """下载异常类"""
-
-    pass
-
-
-# ============ 工具映射表 ============
-
-# API 返回的 type -> 文件扩展名
-API_TYPE_TO_EXT = {
-    "mp3": ".mp3",
-    "flac": ".flac",
-    "m4a": ".m4a",
-    "mp4": ".m4a",
-    "av3a": ".m4a",
-    "ogg": ".ogg",
-    "opus": ".opus",
-}
-
-# 文件扩展名 -> ffmpeg 输出 muxer 名称
-EXT_TO_FFMPEG_FORMAT = {
-    ".mp3": "mp3",
-    ".flac": "flac",
-    ".m4a": "mp4",
-    ".mp4": "mp4",
-    ".ogg": "ogg",
-    ".opus": "opus",
-}
-
-# 支持元数据写入的扩展名
-METADATA_FORMATS = {".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".opus"}
+    def to_dict(self) -> dict[str, Any]:
+        song = self.entry.song
+        return {
+            "music_id": self.entry.song_id,
+            "name": song.get("title", ""),
+            "artist": ", ".join(song.get("artists") or []),
+            "album": song.get("album", ""),
+            "quality": self.entry.level,
+            "requested_quality": self.source.requested_level,
+            "downgraded": self.entry.level != self.source.requested_level,
+            "quality_name": level_name(self.entry.level),
+            "file_type": self.entry.ext.lstrip("."),
+            "file_size": self.entry.size,
+            "file_size_formatted": format_size(self.entry.size),
+            "filename": self.filename,
+            "duration": self.source.duration_ms,
+            "bitrate": self.entry.meta.get("bitrate"),
+            "sample_rate": self.entry.meta.get("sample_rate"),
+            "tag_status": self.entry.meta.get("tag_status"),
+            "warnings": self.warnings or self.entry.meta.get("tag_warnings") or [],
+            "cached": self.cached,
+        }
 
 
-# ============ 核心实现 ============
+def file_md5(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class MusicDownloader:
-    """网易云音乐下载器
-
-    用法:
-        downloader = MusicDownloader(download_dir="downloads")
-        result = downloader.download_music_file(music_id, quality="lossless")
-    """
-
     def __init__(
         self,
-        download_dir: str = "downloads",
-        max_concurrent: int = 3,
-        ffmpeg_path: str | None = None,
+        client: NeteaseClient,
+        store: CacheStore,
+        settings: Settings,
+        *,
+        fetcher: Callable[[TrackSource, Path, ProgressCallback], None] | None = None,
     ):
-        """
-        Args:
-            download_dir: 下载目录
-            max_concurrent: 最大并发下载数
-            ffmpeg_path: ffmpeg 可执行文件路径，为 None 时启动时检测一次
-        """
-        self.download_dir = Path(download_dir)
-        self.download_dir.mkdir(parents=True, exist_ok=True)
-        self.max_concurrent = max_concurrent
-
-        self.api = NeteaseClient(CookieStore("cookie.txt"))
-
-        # ffmpeg 路径缓存：启动时检测一次，写入时还会再懒加载一次
-        self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
-        if not self.ffmpeg_path:
-            print("警告: 未检测到 ffmpeg，写入元数据功能将不可用")
-
-    # ----------- 工具方法 -----------
-
-    def _sanitize_filename(self, filename: str) -> str:
-        """清理文件名非法字符"""
-        filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
-        filename = filename.strip(" .")
-        if len(filename) > 200:
-            filename = filename[:200]
-        return filename or "unknown"
-
-    def _determine_file_extension(
-        self,
-        url: str,
-        content_type: str = "",
-        api_type: str = "",
-    ) -> str:
-        """确定文件扩展名
-
-        优先级: API 返回的 type > URL 后缀 > HTTP Content-Type > 默认 mp3
-        """
-        api_type = (api_type or "").lower()
-        if api_type in API_TYPE_TO_EXT:
-            return API_TYPE_TO_EXT[api_type]
-
-        url_lower = url.lower()
-        if ".flac" in url_lower:
-            return ".flac"
-        if ".mp3" in url_lower:
-            return ".mp3"
-        if ".m4a" in url_lower or ".mp4" in url_lower:
-            return ".m4a"
-
-        content_type = (content_type or "").lower()
-        if "flac" in content_type:
-            return ".flac"
-        if "mpeg" in content_type or "mp3" in content_type:
-            return ".mp3"
-        if "mp4" in content_type or "m4a" in content_type:
-            return ".m4a"
-
-        return ".mp3"
-
-    def _resolve_ffmpeg(self) -> str | None:
-        """懒加载解析 ffmpeg 路径
-
-        每次写入前调用一次：若启动时未检测到，但中途已安装，下一次就能用。
-        """
-        if self.ffmpeg_path:
-            return self.ffmpeg_path
-        path = shutil.which("ffmpeg")
-        if path:
-            self.ffmpeg_path = path  # 回写缓存
-        return path
-
-    # ----------- 信息获取 -----------
-
-    def get_music_info(self, music_id: int, quality: str = "standard") -> MusicInfo:
-        """获取音乐详细信息（同步）"""
-        try:
-            source = self.api.song_url(music_id, quality)
-            if not source.available:
-                raise DownloadException(f"音乐ID {music_id}: {source.error_message}")
-            download_url = source.url
-            song_data = {"type": source.type or "mp3", "size": source.size}
-            song_detail = self.api.song_detail(music_id)
-            lyrics = self.api.lyrics(music_id)
-            lyric, tlyric = lyrics.lrc, lyrics.tlyric
-
-            artists = "/".join(a["name"] for a in song_detail.get("ar", []))
-
-            return MusicInfo(
-                id=music_id,
-                name=song_detail.get("name", "未知歌曲"),
-                artists=artists or "未知艺术家",
-                album=song_detail.get("al", {}).get("name", "未知专辑"),
-                pic_url=song_detail.get("al", {}).get("picUrl", ""),
-                duration=song_detail.get("dt", 0) // 1000,
-                track_number=song_detail.get("no", 0),
-                download_url=download_url,
-                file_type=song_data.get("type", "mp3").lower(),
-                file_size=song_data.get("size", 0),
-                quality=source.level or quality,
-                lyric=lyric,
-                tlyric=tlyric,
-            )
-
-        except DownloadException:
-            raise
-        except NeteaseError as e:
-            raise DownloadException(f"API调用失败: {e}") from e
-        except Exception as e:
-            raise DownloadException(f"获取音乐信息时发生错误: {e}") from e
-
-    # ----------- 文件路径 -----------
-
-    def _build_file_path(self, music_info: MusicInfo) -> Path:
-        """根据 MusicInfo 生成下载文件路径"""
-        filename = f"{music_info.artists} - {music_info.name}"
-        safe = self._sanitize_filename(filename)
-        ext = self._determine_file_extension(
-            music_info.download_url,
-            api_type=music_info.file_type,
+        self.client = client
+        self.store = store
+        self.settings = settings
+        self.http = requests.Session()
+        self.http.headers["User-Agent"] = USER_AGENT
+        retry = Retry(
+            total=3, connect=3, read=0, backoff_factor=0.5, status_forcelist=(500, 502, 503, 504)
         )
-        return self.download_dir / f"{safe}{ext}"
+        self.http.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
+        self.http.mount("http://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
+        self.fetch = fetcher or self._fetch
 
-    # ----------- 下载（同步） -----------
+    # ----------- 对外接口 -----------
 
-    def download_music_file(
+    def download(
         self,
-        music_id: int,
-        quality: str = "standard",
+        song_id: int,
+        level: str,
+        *,
+        strict: bool = False,
+        progress: ProgressCallback | None = None,
     ) -> DownloadResult:
-        """同步下载音乐到本地"""
-        try:
-            music_info = self.get_music_info(music_id, quality)
-            file_path = self._build_file_path(music_info)
-
-            # 已存在则直接返回
-            if file_path.exists():
-                return DownloadResult(
-                    success=True,
-                    file_path=str(file_path),
-                    file_size=file_path.stat().st_size,
-                    music_info=music_info,
-                )
-
-            # 流式下载
-            response = requests.get(music_info.download_url, stream=True, timeout=30)
-            response.raise_for_status()
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-
-            # 写入元数据（失败不影响主流程）
-            self._write_metadata_with_ffmpeg(file_path, music_info)
-
-            return DownloadResult(
-                success=True,
-                file_path=str(file_path),
-                file_size=file_path.stat().st_size,
-                music_info=music_info,
+        progress = progress or (lambda *_: None)
+        progress("resolving", 0, 0)
+        source = self.client.song_url(song_id, level)
+        if not source.available:
+            raise DownloadError(source.error_code, source.error_message)
+        if strict and source.downgraded:
+            raise DownloadError(
+                "QUALITY_DOWNGRADED",
+                f"实际音质为{level_name(source.level)}，与请求的{level_name(level)}不一致",
             )
+        actual = source.level or level
+        cached = True
+        warnings: list[str] = []
+        entry = self._usable(song_id, actual, source)
+        if entry is None or self._needs_retag(entry):
+            with self.store.lock(song_id, actual):
+                entry = self._usable(song_id, actual, source)
+                if entry is None:
+                    cached = False
+                    entry, warnings = self._download_locked(source, progress)
+                elif self._needs_retag(entry):
+                    entry, warnings = self._retag_locked(entry, source)
+        self.store.touch(entry)
+        self.store.evict(protect={entry.path})
+        progress("done", entry.size, entry.size)
+        result = DownloadResult(entry, source, cached, self.display_name(entry), warnings)
+        if self.settings.library_dir:
+            try:
+                self.export(result, self.settings.library_dir)
+            except OSError as e:
+                log.warning("导出到音乐库失败: %s", e)
+        return result
 
-        except DownloadException:
-            raise
-        except requests.RequestException as e:
-            return DownloadResult(success=False, error_message=f"下载请求失败: {e}")
-        except Exception as e:
-            return DownloadResult(success=False, error_message=f"下载过程中发生错误: {e}")
+    def display_name(self, entry: CacheEntry, template: str | None = None) -> str:
+        s = self.settings
+        info = {**entry.song, "level": entry.level, "id": entry.song_id}
+        return build_filename(
+            info,
+            entry.ext,
+            template=template or s.filename_template,
+            separator=s.artist_separator,
+            max_artists=s.max_artists_in_filename,
+            fullwidth=s.fullwidth_replace,
+        )
 
-    # ----------- 下载到内存 -----------
-
-    def download_music_to_memory(
-        self,
-        music_id: int,
-        quality: str = "standard",
-    ) -> tuple[bool, BytesIO, MusicInfo]:
-        """下载音乐到内存"""
-        try:
-            music_info = self.get_music_info(music_id, quality)
-            resp = requests.get(music_info.download_url, timeout=30)
-            resp.raise_for_status()
-            return True, BytesIO(resp.content), music_info
-
-        except DownloadException:
-            raise
-        except requests.RequestException as e:
-            raise DownloadException(f"下载到内存失败: {e}")
-        except Exception as e:
-            raise DownloadException(f"内存下载过程中发生错误: {e}")
-
-    # ----------- 进度查询 -----------
-
-    def get_download_progress(
-        self,
-        music_id: int,
-        quality: str = "standard",
-    ) -> dict[str, Any]:
-        """查询下载进度"""
-        try:
-            music_info = self.get_music_info(music_id, quality)
-            file_path = self._build_file_path(music_info)
-
-            if file_path.exists():
-                current_size = file_path.stat().st_size
-                progress = (
-                    current_size / music_info.file_size * 100 if music_info.file_size > 0 else 0
-                )
-                return {
-                    "music_id": music_id,
-                    "filename": file_path.name,
-                    "total_size": music_info.file_size,
-                    "current_size": current_size,
-                    "progress": min(progress, 100),
-                    "completed": current_size >= music_info.file_size,
-                }
-
-            return {
-                "music_id": music_id,
-                "filename": file_path.name,
-                "total_size": music_info.file_size,
-                "current_size": 0,
-                "progress": 0,
-                "completed": False,
-            }
-
-        except Exception as e:
-            return {
-                "music_id": music_id,
-                "error": str(e),
-                "progress": 0,
-                "completed": False,
-            }
-
-    # ============ ffmpeg 元数据写入（核心） ============
-
-    def _write_metadata_with_ffmpeg(
-        self,
-        file_path: Path,
-        music_info: MusicInfo,
-    ) -> bool:
-        """使用 ffmpeg 写入音频元数据
-
-        处理: title/artist/album/track + 封面（如果是 mp3/flac/m4a/mp4）
-
-        Returns:
-            是否写入成功（失败不影响主流程）
-        """
-        ffmpeg_path = self._resolve_ffmpeg()
-        if not ffmpeg_path:
-            print("跳过元数据写入: ffmpeg 不可用")
-            return False
-
-        file_ext = file_path.suffix.lower()
-        if file_ext not in METADATA_FORMATS:
-            print(f"跳过元数据写入: 不支持的格式 {file_ext}")
-            return False
-
-        if not file_path.exists():
-            print(f"跳过元数据写入: 文件不存在 {file_path}")
-            return False
-
-        # 临时输出文件：保留原扩展名在最后，便于 ffmpeg 识别 muxer
-        # 例: 艾辰 - 错位时空.tagging.flac
-        tmp_output = file_path.with_name(file_path.stem + ".tagging" + file_path.suffix)
-        # 临时封面文件
-        cover_tmp: str | None = None
-
-        try:
-            # 下载封面到临时文件
-            if music_info.pic_url:
-                try:
-                    pic_resp = requests.get(music_info.pic_url, timeout=10)
-                    pic_resp.raise_for_status()
-                    fd, cover_tmp = tempfile.mkstemp(suffix=".jpg", dir=str(self.download_dir))
-                    os.close(fd)
-                    with open(cover_tmp, "wb") as cf:
-                        cf.write(pic_resp.content)
-                except Exception as e:
-                    print(f"封面下载失败，跳过封面写入: {e}")
-                    cover_tmp = None
-
-            # 构造 ffmpeg 命令
-            # 顺序: global opts -> -i input1 -> -i input2 -> metadata -> mapping -> -f format -> output
-            output_format = EXT_TO_FFMPEG_FORMAT.get(file_ext, "")
-            cmd: list[str] = [
-                ffmpeg_path,
-                "-y",
-                "-loglevel",
-                "error",
-                "-i",
-                str(file_path),
-            ]
-            if cover_tmp:
-                cmd += ["-i", cover_tmp]
-
-            # 通用元数据
-            meta = {
-                "title": music_info.name,
-                "artist": music_info.artists,
-                "album": music_info.album,
-                "album_artist": music_info.artists,
-                "comment": "Downloaded from Netease Cloud Music",
-            }
-            if music_info.track_number > 0:
-                meta["track"] = str(music_info.track_number)
-                meta["tracktotal"] = str(music_info.track_number)
-            for k, v in meta.items():
-                if v:
-                    cmd += ["-metadata", f"{k}={v}"]
-
-            # 各格式的 mapping / 编码选项
-            cmd += self._build_format_args(file_ext, has_cover=bool(cover_tmp))
-
-            # -f 必须放在所有 -i 之后（作为 output option）才生效
-            if output_format:
-                cmd += ["-f", output_format]
-            cmd.append(str(tmp_output))
-
-            # 执行
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                encoding="utf-8",
-                errors="ignore",
+    def export(
+        self, result: DownloadResult, target_dir: Path, *, template: str | None = None
+    ) -> Path:
+        """按友好文件名导出（同盘硬链接，否则复制）。同名但不是同一首歌时自动加专辑名或 ID 区分。"""
+        target_dir.mkdir(parents=True, exist_ok=True)
+        entry = result.entry
+        name = self.display_name(entry, template)
+        stem, ext = name[: -len(entry.ext)], entry.ext
+        album = entry.song.get("album") or ""
+        candidates = [name]
+        if album:
+            candidates.append(f"{stem} ({album}){ext}")
+        candidates.append(f"{stem} [{entry.song_id}]{ext}")
+        for candidate in candidates:
+            dst = target_dir / build_filename(
+                {"id": entry.song_id, "title": candidate[: -len(ext)]},
+                ext,
+                template="{title}",
+                fullwidth=self.settings.fullwidth_replace,
             )
+            if dst.exists():
+                if read_song_id(dst) != entry.song_id:
+                    continue  # 同名的另一首歌
+                if dst.stat().st_size == entry.size:
+                    break  # 已经导出过
+            tmp = dst.with_name(f".{dst.name}.tmp")
+            tmp.unlink(missing_ok=True)
+            try:
+                os.link(entry.path, tmp)
+            except OSError:
+                shutil.copy2(entry.path, tmp)
+            os.replace(tmp, dst)
+            break
+        else:  # pragma: no cover - 候选名都被其他歌曲占用
+            raise OSError(f"无法为 {name} 找到可用的文件名")
+        lyric_text = entry.meta.get("lyrics") or ""
+        if lyric_text and self.settings.lyrics_mode in ("lrc", "both"):
+            atomic_write_text(dst.with_suffix(".lrc"), lyric_text)
+        return dst
 
-            if result.returncode == 0 and tmp_output.exists():
-                # 原子替换原文件
-                shutil.move(str(tmp_output), str(file_path))
-                return True
+    # ----------- 缓存判断 -----------
 
-            print(f"ffmpeg 写入元数据失败: {(result.stderr or result.stdout or '').strip()}")
-            return False
+    def _usable(self, song_id: int, level: str, source: TrackSource) -> CacheEntry | None:
+        entry = self.store.find(song_id, level)
+        if entry is None:
+            return None
+        if source.md5 and entry.meta.get("source_md5") not in (None, source.md5):
+            log.info("歌曲 %s/%s 的源文件已更新，重新下载", song_id, level)
+            return None
+        return entry
 
-        except subprocess.TimeoutExpired:
-            print("ffmpeg 执行超时")
-            return False
-        except FileNotFoundError:
-            print(f"ffmpeg 可执行文件未找到: {ffmpeg_path}")
-            return False
-        except Exception as e:
-            print(f"ffmpeg 写入元数据异常: {e}")
-            return False
-        finally:
-            # 清理封面临时文件
-            if cover_tmp and os.path.exists(cover_tmp):
-                try:
-                    os.unlink(cover_tmp)
-                except OSError:
-                    pass
-            # 清理可能残留的临时输出
-            if tmp_output.exists():
-                try:
-                    tmp_output.unlink()
-                except OSError:
-                    pass
+    @staticmethod
+    def _needs_retag(entry: CacheEntry) -> bool:
+        if int(entry.meta.get("tag_version") or 0) < TAG_VERSION:
+            return True
+        return (
+            entry.meta.get("tag_status") != "ok"
+            and int(entry.meta.get("tag_attempts") or 0) < MAX_TAG_ATTEMPTS
+        )
 
-    def _build_format_args(self, file_ext: str, has_cover: bool) -> list[str]:
-        """根据文件格式构造 mapping / 编码参数"""
-        if file_ext == ".mp3":
-            # MP3: 封面通过 ID3v2 APIC 帧写入
-            if has_cover:
-                return [
-                    "-map",
-                    "0:a",
-                    "-map",
-                    "1:v",
-                    "-c:a",
-                    "copy",
-                    "-c:v",
-                    "copy",
-                    "-id3v2_version",
-                    "3",
-                    "-metadata:s:v",
-                    "title=Album cover",
-                    "-metadata:s:v",
-                    "comment=Cover (front)",
-                ]
-            return ["-map", "0:a", "-c:a", "copy", "-id3v2_version", "3"]
+    # ----------- 下载与标签（调用方持有锁） -----------
 
-        if file_ext == ".flac":
-            # FLAC: 原生支持封面
-            if has_cover:
-                return [
-                    "-map",
-                    "0",
-                    "-map",
-                    "1",
-                    "-c",
-                    "copy",
-                    "-disposition:v:0",
-                    "attached_pic",
-                ]
-            return ["-map", "0", "-c", "copy"]
+    def _download_locked(
+        self, source: TrackSource, progress: ProgressCallback
+    ) -> tuple[CacheEntry, list[str]]:
+        song_id, level = source.song_id, source.level
+        self.store.remove(song_id, level)  # 清掉损坏或过期的旧条目
+        part = self.store.part_path(song_id, level)
+        part.parent.mkdir(parents=True, exist_ok=True)
+        for attempt in (1, 2):
+            try:
+                self.fetch(source, part, progress)
+                break
+            except DownloadError as e:
+                if e.code != "CHECKSUM_MISMATCH" or attempt == 2:
+                    raise
+                log.warning("歌曲 %s 的 md5 校验失败，重新下载", song_id)
+        fmt = sniff_format(part)
+        ext = EXT_BY_FORMAT.get(fmt or "") or source.ext or ".bin"
+        progress("tagging", source.size, source.size)
+        meta, warnings = self._tag(part, source)
+        meta.update(
+            source_md5=source.md5,
+            source_size=source.size,
+            type=source.type,
+            bitrate=source.bitrate,
+            sample_rate=source.sample_rate,
+            duration_ms=source.duration_ms,
+        )
+        entry = self.store.commit(song_id, level, part, ext, meta)
+        log.info("已缓存 %s/%s (%s)", song_id, level, format_size(entry.size))
+        return entry, warnings
 
-        if file_ext == ".m4a":
-            # M4A: AAC 音频 + mp4 容器
-            if has_cover:
-                return [
-                    "-map",
-                    "0:a",
-                    "-map",
-                    "1:v",
-                    "-c",
-                    "copy",
-                    "-disposition:v:0",
-                    "attached_pic",
-                    "-metadata:s:v",
-                    "title=Album cover",
-                    "-metadata:s:v",
-                    "comment=Cover (front)",
-                ]
-            return ["-map", "0:a", "-c:a", "copy"]
+    def _retag_locked(self, entry: CacheEntry, source: TrackSource) -> tuple[CacheEntry, list[str]]:
+        part = self.store.part_path(entry.song_id, entry.level)
+        shutil.copyfile(entry.path, part)
+        attempts = int(entry.meta.get("tag_attempts") or 0) + 1
+        meta, warnings = self._tag(part, source, attempts=attempts)
+        try:
+            entry = self.store.commit(
+                entry.song_id, entry.level, part, entry.ext, {**entry.meta, **meta}
+            )
+        except PermissionError:
+            part.unlink(missing_ok=True)  # Windows 上文件正在被读取，下次再重写
+        return entry, warnings
 
-        if file_ext == ".mp4":
-            # MP4 (杜比全景声 EAC3 / 其它 mp4 容器音频)
-            # 杜比文件通常无视频流，封面作为 video stream 注入；+faststart 让 moov 在文件头
-            if has_cover:
-                return [
-                    "-map",
-                    "0",
-                    "-map",
-                    "1:v",
-                    "-c",
-                    "copy",
-                    "-disposition:v:0",
-                    "attached_pic",
-                    "-metadata:s:v",
-                    "title=Album cover",
-                    "-metadata:s:v",
-                    "comment=Cover (front)",
-                    "-movflags",
-                    "+faststart",
-                ]
-            return ["-map", "0", "-c", "copy", "-movflags", "+faststart"]
+    def _tag(
+        self, path: Path, source: TrackSource, attempts: int = 1
+    ) -> tuple[dict[str, Any], list[str]]:
+        s = self.settings
+        warnings: list[str] = []
+        song = self.client.song_detail(source.song_id)
+        album = None
+        album_id = (song.get("al") or {}).get("id")
+        if album_id:
+            try:
+                album = self.client.album_tag_info(album_id)
+            except NeteaseError:
+                warnings.append("专辑信息获取失败")
+        lyric_text = ""
+        try:
+            lyr = self.client.lyrics(source.song_id)
+            if not lyr.no_lyrics:
+                lyric_text = lyrics_mod.build(lyr.lrc, lyr.tlyric, translation=s.lyrics_translation)
+        except NeteaseError:
+            warnings.append("歌词获取失败")
+        pic_url = (song.get("al") or {}).get("picUrl") or ""
+        cover = fetch_cover(pic_url, s.cover_size, session=self.http) if pic_url else None
+        if pic_url and cover is None:
+            warnings.append("封面获取失败")
+        tags = build_tags(song, album, lyric_text, cover)
+        status = "partial" if warnings else "ok"
+        try:
+            write_tags(
+                path,
+                tags,
+                id3_version=s.id3_version,
+                embed_lyrics=s.lyrics_mode in ("embed", "both"),
+            )
+        except TaggingError as e:
+            status = "failed"
+            warnings.append(str(e))
+            log.warning("歌曲 %s 写入标签失败: %s", source.song_id, e)
+        meta = {
+            "tag_version": TAG_VERSION,
+            "tag_status": status,
+            "tag_warnings": warnings,
+            "tag_attempts": attempts,
+            "song": tags.snapshot(),
+            "lyrics": lyric_text,
+        }
+        return meta, warnings
 
-        if file_ext in (".ogg", ".opus"):
-            if has_cover:
-                return [
-                    "-map",
-                    "0:a",
-                    "-map",
-                    "1:v",
-                    "-c:a",
-                    "copy",
-                    "-c:v",
-                    "copy",
-                ]
-            return ["-map", "0:a", "-c:a", "copy"]
+    def _fetch(self, source: TrackSource, part: Path, progress: ProgressCallback) -> None:
+        """下载到 .part：支持续传，网络中断自动重试，最后校验大小和 md5。"""
+        expected = source.size
+        last_error: Exception | None = None
+        for attempt in range(4):
+            have = part.stat().st_size if part.exists() else 0
+            if expected and have > expected:
+                part.unlink()
+                have = 0
+            if expected and have == expected:
+                break
+            headers = {"Range": f"bytes={have}-"} if have else {}
+            if have:
+                log.info("续传歌曲 %s：已有 %s", source.song_id, format_size(have))
+            try:
+                with self.http.get(
+                    source.url, headers=headers, stream=True, timeout=(10, 60)
+                ) as resp:
+                    if resp.status_code == 416:
+                        part.unlink(missing_ok=True)
+                        continue
+                    if resp.status_code not in (200, 206):
+                        raise DownloadError("DOWNLOAD_FAILED", f"下载失败: HTTP {resp.status_code}")
+                    if have and resp.status_code == 200:
+                        have = 0  # 服务器没有按 Range 返回，从头下载
+                    total = expected or have + int(resp.headers.get("Content-Length") or 0)
+                    done = have
+                    with open(part, "ab" if have else "wb") as f:
+                        for chunk in resp.iter_content(CHUNK):
+                            f.write(chunk)
+                            done += len(chunk)
+                            progress("downloading", done, total)
+                if not expected or part.stat().st_size >= expected:
+                    break
+            except requests.RequestException as e:
+                last_error = e
+                time.sleep(1 + attempt)
+        else:
+            raise DownloadError(
+                "DOWNLOAD_FAILED", f"下载失败: {last_error or '多次重试后仍未完成'}"
+            )
+        progress("verifying", expected, expected)
+        size = part.stat().st_size
+        if expected and size != expected:
+            part.unlink(missing_ok=True)
+            raise DownloadError("DOWNLOAD_FAILED", f"文件大小不符（{size} != {expected}）")
+        if source.md5 and file_md5(part) != source.md5:
+            part.unlink(missing_ok=True)
+            raise DownloadError("CHECKSUM_MISMATCH")
 
-        # 默认
-        if has_cover:
-            return ["-map", "0:a", "-map", "1:v", "-c", "copy"]
-        return ["-map", "0:a", "-c:a", "copy"]
+
+# ============ 命令行 ============
 
 
-# ============ CLI 入口 ============
+def _parse_song_id(text: str) -> int | None:
+    text = text.strip()
+    m = re.search(r"[?&]id=(\d+)", text) or re.fullmatch(r"\D*?(\d{1,20})\D*", text)
+    return int(m.group(1)) if m else None
+
+
+def _build(settings: Settings) -> MusicDownloader:
+    store = CacheStore(settings.cache_dir, settings.max_cache_bytes)
+    store.cleanup_parts()
+    return MusicDownloader(NeteaseClient.from_settings(settings), store, settings)
+
+
+def _cmd_info(dl: MusicDownloader, args) -> int:
+    song = dl.client.song_detail(args.id)
+    source = dl.client.song_url(args.id, args.level)
+    artists = "/".join(a.get("name", "") for a in song.get("ar") or [])
+    print(f"歌曲: {song.get('name')} - {artists}")
+    print(f"专辑: {(song.get('al') or {}).get('name', '')}")
+    if not source.available:
+        print(f"无法获取 {level_name(args.level)}: {source.error_message}")
+        return 1
+    flag = "（已降级）" if source.downgraded else ""
+    print(
+        f"音质: {level_name(source.level)}{flag}  {source.type}  {source.sample_rate}Hz  "
+        f"{source.bitrate // 1000}kbps  {format_size(source.size)}"
+    )
+    return 0
+
+
+def _cmd_download(dl: MusicDownloader, args) -> int:
+    result = dl.download(args.id, args.level, strict=args.strict)
+    path = dl.export(result, Path(args.out), template=args.template)
+    flag = ""
+    if result.source.downgraded:
+        flag = f"（请求 {level_name(args.level)}，实际 {level_name(result.entry.level)}）"
+    print(f"已保存: {path}{flag}")
+    for w in result.warnings:
+        print(f"  注意: {w}")
+    return 0
+
+
+def _cmd_batch(dl: MusicDownloader, args) -> int:
+    ids: list[int] = []
+    for n, line in enumerate(Path(args.file).read_text(encoding="utf-8-sig").splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        song_id = _parse_song_id(line)
+        if song_id is None:
+            print(f"第 {n} 行无法识别，已跳过: {line.strip()!r}")
+        else:
+            ids.append(song_id)
+    ids = list(dict.fromkeys(ids))
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    existing = set() if args.force else {read_song_id(p) for p in out.iterdir() if p.is_file()}
+    todo = [i for i in ids if i not in existing]
+    print(
+        f"共 {len(ids)} 首，其中 {len(ids) - len(todo)} 首已在 {out} 中，开始下载 {len(todo)} 首..."
+    )
+    failed: dict[int, str] = {}
+
+    def run(song_id: int) -> str:
+        result = dl.download(song_id, args.level, strict=args.strict)
+        path = dl.export(result, out, template=args.template)
+        note = f"（实际 {level_name(result.entry.level)}）" if result.source.downgraded else ""
+        return f"{path.name}{note}"
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(run, i): i for i in todo}
+        for done, future in enumerate(as_completed(futures), 1):
+            song_id = futures[future]
+            try:
+                print(f"[{done}/{len(todo)}] 完成: {future.result()}")
+            except (DownloadError, NeteaseError) as e:
+                failed[song_id] = e.message
+                print(f"[{done}/{len(todo)}] 失败 {song_id}: {e.message}")
+            except Exception as e:  # 单首失败不影响其他歌曲
+                failed[song_id] = str(e)
+                print(f"[{done}/{len(todo)}] 失败 {song_id}: {e}")
+    if failed:
+        print(f"\n{len(failed)} 首下载失败：")
+        for song_id, reason in failed.items():
+            print(f"  {song_id}: {reason}")
+        return 1
+    print("\n全部完成")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    settings = Settings.from_env()
+    parser = argparse.ArgumentParser(description="网易云音乐下载器")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def common(p: argparse.ArgumentParser, out: bool = True) -> None:
+        p.add_argument(
+            "--level", "-l", default=settings.default_level, help="音质，默认 %(default)s"
+        )
+        if out:
+            p.add_argument("--out", "-o", default="downloads", help="保存目录，默认 %(default)s")
+            p.add_argument(
+                "--template", "-t", default=None, help="文件名模板，例如 '{title}-{artists}'"
+            )
+            p.add_argument("--strict", action="store_true", help="实际音质与请求不一致时视为失败")
+
+    p = sub.add_parser("info", help="查看歌曲信息和实际可得的音质")
+    p.add_argument("id", type=_parse_song_id)
+    common(p, out=False)
+    p = sub.add_parser("download", help="下载单首歌曲")
+    p.add_argument("id", type=_parse_song_id)
+    common(p)
+    p = sub.add_parser("batch", help="批量下载（文件中每行一个 ID 或链接）")
+    p.add_argument("file")
+    p.add_argument("--workers", "-w", type=int, default=settings.max_concurrent_downloads)
+    p.add_argument("--force", action="store_true", help="目标目录已有同一首歌时也重新导出")
+    common(p)
+    args = parser.parse_args(argv)
+    if getattr(args, "id", 1) is None:
+        parser.error("无法识别的歌曲 ID 或链接")
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    dl = _build(settings)
+    handler = {"info": _cmd_info, "download": _cmd_download, "batch": _cmd_batch}[args.command]
+    try:
+        return handler(dl, args)
+    except (DownloadError, NeteaseError) as e:
+        print(f"失败: {e.message}")
+        return 1
+
 
 if __name__ == "__main__":
-    import sys
-    from dataclasses import asdict
-
-    downloader = MusicDownloader()
-
-    # 无参数：打印模块信息
-    if len(sys.argv) < 2:
-        print("网易云音乐下载器")
-        print(f"ffmpeg 路径: {downloader.ffmpeg_path or '未找到'}")
-        print(
-            "支持的音质: standard / exhigh / lossless / hires / sky / jyeffect / jymaster / dolby"
-        )
-        print("支持的功能: 同步下载、内存下载、进度查询、ffmpeg 元数据写入")
-        print()
-        print("用法:")
-        print("  python music_downloader.py <music_id> [quality]            # 仅打印信息")
-        print("  python music_downloader.py <music_id> [quality] --download # 打印并下载")
-        print()
-        print("示例:")
-        print("  python music_downloader.py 123456")
-        print("  python music_downloader.py 123456 lossless")
-        print("  python music_downloader.py 123456 hires --download")
-        sys.exit(0)
-
-    # 解析参数
-    try:
-        music_id = int(sys.argv[1])
-    except ValueError:
-        print(f"错误: music_id 必须是整数，收到: {sys.argv[1]!r}")
-        sys.exit(1)
-
-    quality = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else "lossless"
-    do_download = "--download" in sys.argv
-
-    # 打印音乐信息
-    try:
-        info = downloader.get_music_info(music_id, quality)
-    except DownloadException as e:
-        print(f"获取音乐信息失败: {e}")
-        sys.exit(1)
-
-    print()
-    print("=" * 70)
-    print(f"音乐信息  (ID={info.id}, quality={info.quality})")
-    print("=" * 70)
-
-    info_dict = asdict(info)
-    for key, value in info_dict.items():
-        # 歌词太长，只显示行数
-        if key in ("lyric", "tlyric"):
-            lines = [ln for ln in (value or "").splitlines() if ln.strip()]
-            preview = " | ".join(lines[:2])[:80] if lines else "(空)"
-            print(f"  {key:<14}: {len(lines)} 行  预览: {preview}{'...' if len(lines) > 2 else ''}")
-            continue
-        # URL 类字段：完整展示（如果终端窄可换行）
-        if key in ("download_url", "pic_url"):
-            print(f"  {key:<14}: {value}")
-            continue
-        print(f"  {key:<14}: {value}")
-
-    print("=" * 70)
-
-    # 可选：触发下载
-    if do_download:
-        print()
-        print("开始下载...")
-        result = downloader.download_music_file(music_id, quality)
-        if result.success:
-            print(f"下载完成: {result.file_path}  ({result.file_size} 字节)")
-        else:
-            print(f"下载失败: {result.error_message}")
-            sys.exit(1)
+    sys.exit(main())

@@ -19,7 +19,8 @@ from flask import Blueprint, Flask, current_app, jsonify, render_template, reque
 from config import Settings
 from levels import LEVELS, get_level, level_name
 from music_api import NeteaseClient, NeteaseError
-from music_downloader import DownloadException, MusicDownloader
+from music_downloader import DownloadError, MusicDownloader
+from storage import CacheStore
 from utils import format_size
 
 VERSION = "3.0.0"
@@ -70,6 +71,7 @@ ERROR_STATUS = {
     "QUALITY_DOWNGRADED": 409,
     "UPSTREAM_ERROR": 502,
     "DOWNLOAD_FAILED": 502,
+    "CHECKSUM_MISMATCH": 502,
 }
 
 
@@ -275,34 +277,32 @@ def download():
     return_format = data.get("format") or "file"
     if return_format not in ("file", "json"):
         raise ApiError("返回格式只支持 'file' 或 'json'", 400, "INVALID_INPUT")
-    try:
-        result = services().downloader.download_music_file(song_id, level)
-    except DownloadException as e:
-        raise ApiError(f"下载失败: {e}", 502, "DOWNLOAD_FAILED") from e
-    if not result.success:
-        raise ApiError(f"下载失败: {result.error_message}", 502, "DOWNLOAD_FAILED")
-    info = result.music_info
-    path = Path(result.file_path)
+    result = run_download(song_id, level, strict=bool_param(data, "strict"))
     if return_format == "json":
-        return ok(
-            {
-                "music_id": song_id,
-                "name": info.name,
-                "artist": info.artists,
-                "album": info.album,
-                "quality": info.quality,
-                "requested_quality": level,
-                "quality_name": level_name(info.quality),
-                "file_type": info.file_type,
-                "file_size": path.stat().st_size,
-                "file_size_formatted": format_size(path.stat().st_size),
-                "filename": path.name,
-                "duration": info.duration,
-            },
-            "下载完成",
-        )
-    response = send_file(path, as_attachment=True, download_name=path.name, conditional=True)
-    response.headers["X-Download-Filename"] = quote(path.name, safe="")
+        return ok(result.to_dict(), "下载完成")
+    return send_audio(result.entry.path, result.filename)
+
+
+def run_download(song_id: int, level: str, *, strict: bool = False):
+    try:
+        return services().downloader.download(song_id, level, strict=strict)
+    except DownloadError as e:
+        raise ApiError(e.message, ERROR_STATUS.get(e.code, 502), e.code) from e
+
+
+AUDIO_MIME = {".mp3": "audio/mpeg", ".flac": "audio/flac", ".m4a": "audio/mp4", ".ogg": "audio/ogg"}
+
+
+def send_audio(path: Path, filename: str):
+    response = send_file(
+        path,
+        mimetype=AUDIO_MIME.get(path.suffix, "application/octet-stream"),
+        as_attachment=True,
+        download_name=filename,
+        conditional=True,
+        max_age=0,
+    )
+    response.headers["X-Download-Filename"] = quote(filename, safe="")
     return response
 
 
@@ -379,8 +379,11 @@ def create_app(
     setup_logging(settings)
     client = client or NeteaseClient.from_settings(settings)
     if downloader is None:
-        downloader = MusicDownloader(download_dir=str(settings.data_dir / "downloads"))
-        downloader.api = client
+        store = CacheStore(settings.cache_dir, settings.max_cache_bytes)
+        removed = store.cleanup_parts()
+        if removed:
+            log.info("已清理 %d 个过期的下载临时文件", removed)
+        downloader = MusicDownloader(client, store, settings)
     app = Flask(__name__)
     app.json.ensure_ascii = False
     app.extensions["netease"] = Services(settings, client, downloader)

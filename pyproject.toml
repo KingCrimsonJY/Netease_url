@@ -14,10 +14,6 @@ extend-exclude = [".venv", "data"]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
-[tool.ruff.lint.per-file-ignores]
-# 旧代码，重写后删除
-"music_downloader.py" = ["B904"]
-
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
