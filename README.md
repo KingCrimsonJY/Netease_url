@@ -1,318 +1,147 @@
 # 网易云音乐无损解析
 
-<div align="center">
+网易云音乐解析与下载服务：歌曲搜索、单曲解析、歌单 / 专辑解析、多音质下载（自动写入标签、封面和歌词），提供网页界面、HTTP 接口和命令行。
 
-![GitHub stars](https://img.shields.io/github/stars/Suxiaoqinx/Netease_url?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/Suxiaoqinx/Netease_url?style=flat-square)
-![GitHub issues](https://img.shields.io/github/issues/Suxiaoqinx/Netease_url?style=flat-square)
-![GitHub license](https://img.shields.io/github/license/Suxiaoqinx/Netease_url?style=flat-square)
+本仓库 fork 自 [Suxiaoqinx/Netease_url](https://github.com/Suxiaoqinx/Netease_url)，修复了原版在音质、下载缓存、并发、元数据和安全方面的一系列问题，详见文末[主要改动](#与上游相比的主要改动)。
 
-**功能强大的网易云音乐解析工具**
+## 授权说明
 
-支持歌曲搜索 | 单曲解析 | 歌单解析 | 专辑解析 | 音乐下载
+源代码基于 **MIT License** 开源。上游作者的线上体验站是其独立开发的闭源产品，不属于本仓库。
 
-[在线体验](https://wyapi.toubiec.cn) • [使用文档](./使用文档.md) • [问题反馈](https://github.com/Suxiaoqinx/Netease_url/issues)
+## 功能
 
-</div>
+- **10 档音质**，并且如实告诉你实际拿到的是哪一档（请求的音质不可用时会标明"已降级"）
+- **下载**：断点续传、按接口返回的 md5 校验、并发安全；网页上显示真实进度，完成后由浏览器直接保存
+- **元数据**：标题、艺人、专辑、专辑艺人、曲号/总数、碟号、发行日期、作曲、作词、唱片公司、歌词（可合并翻译）、封面（1200px JPEG），支持 FLAC / MP3 / M4A
+- **文件名**：可配置模板，跨平台安全（非法字符转全角、长度按字节控制、保留原名信息）
+- 歌单 / 专辑解析（一万首的歌单约 8 秒）、隐私歌单、各种分享链接和短链接
+- 账号状态与会员到期提醒、扫码登录
+- 访问令牌、限流、默认只监听本机
 
----
+## 音质
 
-## 授权说明 / License
+| 参数 | 名称 | 实测格式（以具体歌曲为准） |
+| --- | --- | --- |
+| `standard` | 标准音质 | MP3 128kbps |
+| `higher` | 较高音质 | MP3 192kbps |
+| `exhigh` | 极高音质 | MP3 320kbps |
+| `lossless` | 无损音质 | FLAC 16/24bit |
+| `hires` | Hi-Res音质 | FLAC 24bit / 48~96kHz |
+| `jyeffect` | 高清臻音 | FLAC 24bit / 96kHz |
+| `sky` | 沉浸环绕声 | FLAC 5.1 声道 |
+| `dolby` | 杜比全景声 | EAC3 Dolby Atmos 5.1（.m4a） |
+| `vivid` | 臻音全景声 | Audio Vivid（.m4a，多数播放器暂不支持） |
+| `jymaster` | 超清母带 | FLAC 24bit / 192kHz |
 
-本仓库中的源代码基于 **MIT License** 开源，任何人可按 MIT 条款使用、修改和分发本仓库代码。
+上游说明：sky、jymaster 需要黑胶 SVIP，其余高于标准的音质需要黑胶 VIP。具体以账号权限为准，网页解析单曲时会显示"账号最高可用"的音质。
 
-⚠️ 注意：
-线上体验版本（Online Demo / 官网体验页）是作者另行独立开发的闭源产品，
-不属于本仓库 MIT 代码的一部分。
-线上版本的权利声明以对应产品页面为准（可能标注 All rights reserved）。
+歌曲没有所选音质时，网易云会返回其他音质（例如没有杜比版本的歌请求 `dolby` 会得到 `jyeffect`）。接口和网页都会显示实际音质；加 `strict=1` 可让这种情况直接报错。
 
-简单说：
-- 本仓库代码 → MIT
-- 线上体验站 → 闭源，独立作品
+## 快速开始
 
-## ✨ 功能特性
+需要 Python 3.12 或更高版本。
 
-### 🎵 核心功能
-- **🔍 歌曲搜索**：支持关键词搜索网易云音乐库中的歌曲
-- **🎧 单曲解析**：解析单首歌曲的详细信息和下载链接
-- **📋 歌单解析**：批量解析歌单中的所有歌曲信息
-- **💿 专辑解析**：批量解析专辑中的所有歌曲信息
-- **⬇️ 音乐下载**：支持多种音质的音乐文件下载
-
-### 🎼 音质支持
-- `standard`：标准音质 (128kbps)
-- `exhigh`：极高音质 (320kbps)
-- `lossless`：无损音质 (FLAC)
-- `hires`：Hi-Res音质 (24bit/96kHz)
-- `jyeffect`：高清环绕声
-- `sky`：沉浸环绕声
-- `jymaster`：超清母带
-
-### 🌐 使用方式
-- **Web界面**：直观友好的网页操作界面
-- **RESTful API**：完整的API接口支持
-- **批量处理**：支持歌单和专辑的批量解析
-- **多格式支持**：支持ID和链接多种输入格式
-
----
-
-## 🚀 快速开始
-
-### 环境要求
-- Python 3.7+
-- 网易云音乐黑胶会员账号
-
-### 安装步骤
-
-#### 1. 克隆项目
 ```bash
-git clone https://github.com/Suxiaoqinx/Netease_url.git
+git clone https://github.com/KingCrimsonJY/Netease_url.git
 cd Netease_url
+pip install -r requirements.lock
 ```
 
-#### 2. 安装依赖
-```bash
-pip install -r requirements.txt
-```
+### 配置 cookie
 
-#### 3. 配置Cookie
-在 `cookie.txt` 文件中填入黑胶会员账号的Cookie：
+只需要 `MUSIC_U`，`os`、`appver` 等设备参数会自动补全。任选一种方式：
 
-> 💡 **获取Cookie方法**：登录网易云音乐网页版 → F12开发者工具 → Network标签页 → 复制任意请求的Cookie值
+- **扫码登录**（推荐）：运行 `python qr_login.py login`，用网易云 App 扫描终端里的二维码；也可以在网页右上角点"扫码登录"
+- **手动填写**：登录 [music.163.com](https://music.163.com)，按 F12 → Application → Cookies，复制 `MUSIC_U` 的值，按 `cookie.example.txt` 的格式写入项目目录下的 `cookie.txt`
 
+`python qr_login.py status` 可以查看是否已登录以及会员到期时间。
 
-> 杜比全景声音质需要设备支持，不同的设备可能会返回不同码率的 url cookie 需要传入os=pc保证返回正常码率的 url
+### 启动
 
-#### 4. 启动服务
 ```bash
 python main.py
 ```
 
-#### 5. 访问界面
-打开浏览器访问：`http://localhost:5000`
+打开 http://127.0.0.1:5000 。如需修改端口、缓存位置等，把 `.env.example` 复制为 `.env` 后修改。
 
-### 🐳 Docker部署
+## 命令行下载
 
 ```bash
-# 使用Docker Compose
-docker-compose up -d
+# 查看某首歌能拿到的实际音质
+python music_downloader.py info 1901371647 --level jymaster
 
-# 或使用Docker
-docker build -t netease-music-api .
-docker run -d -p 5000:5000 netease-music-api
+# 下载单首（支持 ID、链接或分享文本）
+python music_downloader.py download "https://music.163.com/#/song?id=1901371647" --level lossless --out Music
+
+# 批量下载：文件中每行一个 ID 或链接；目标目录里已有的歌曲会跳过，最后汇总失败原因
+python music_downloader.py batch songs.txt --level exhigh --out Music --workers 5 --template "{title}-{artists}"
 ```
 
----
+`--strict` 表示实际音质与所选不一致时视为失败。
 
-## 📖 使用指南
+## 文件名与元数据
 
-### Web界面使用
+- 默认文件名：`歌手 - 歌名.扩展名`。多位歌手用 `, ` 分隔，超过 3 位时显示前 3 位加"等"
+- 模板变量：`{artists}` `{artist}` `{title}` `{album}` `{track:02d}` `{disc}` `{year}` `{level}` `{quality_name}` `{id}`
+- `/ \ : * ? " < > |` 替换为对应全角字符（`FULLWIDTH_REPLACE=false` 改为 `_`）；Windows 保留名（CON 等）会自动处理；主文件名不超过 180 字节
+- 标签字段：FLAC 使用 Vorbis 注释（多位艺人分别写入），MP3 使用 ID3v2.3（多值以 `/` 分隔，`ID3_VERSION=4` 可改为 v2.4），M4A 使用 iTunes 标准字段。另外写入 `NETEASE_SONG_ID`，用来判断同名文件是否为同一首歌
+- 封面类型为"封面（正面）"，默认 1200×1200 JPEG（约 300KB）
 
-#### 🔍 歌曲搜索
-1. 选择功能：**歌曲搜索**
-2. 输入关键词（歌曲名、歌手名等）
-3. 点击**搜索**按钮
-4. 在搜索结果中点击**解析**或**下载**按钮
+## 缓存
 
-#### 🎧 单曲解析
-1. 选择功能：**单曲解析**
-2. 输入歌曲ID或网易云音乐链接
-   - 支持格式：`1234567890` 或 `https://music.163.com/song?id=1234567890`
-3. 点击**解析**按钮查看歌曲信息
+服务端下载的文件缓存在 `data/cache/{歌曲ID}/{音质}.{扩展名}`，按"歌曲 + 实际音质"区分，不会因为同名而串用。超过 `MAX_CACHE_GB`（默认 20GB）后删除最久未使用的文件。设置 `LIBRARY_DIR` 后，每次下载完成还会按友好文件名把文件硬链接到该目录，适合当作 NAS 音乐库。
 
-#### 📋 歌单解析
-1. 选择功能：**歌单解析**
-2. 输入歌单ID或网易云音乐歌单链接
-   - 支持格式：`1234567890` 或 `https://music.163.com/playlist?id=1234567890`
-3. 点击**解析**按钮查看歌单中所有歌曲
-4. 点击单首歌曲的**解析**或**下载**按钮
+## Docker
 
-#### 💿 专辑解析
-1. 选择功能：**专辑解析**
-2. 输入专辑ID或网易云音乐专辑链接
-   - 支持格式：`1234567890` 或 `https://music.163.com/album?id=1234567890`
-3. 点击**解析**按钮查看专辑中所有歌曲
-4. 点击单首歌曲的**解析**或**下载**按钮
-
-#### ⬇️ 音乐下载
-1. 选择功能：**音乐下载**
-2. 输入歌曲ID或链接
-3. 选择音质（标准/极高/无损/Hi-Res等）
-4. 点击**下载**按钮
-
-### 支持的链接格式
-
-```
-# 歌曲链接
-https://music.163.com/song?id=1234567890
-https://music.163.com/#/song?id=1234567890
-
-# 歌单链接
-https://music.163.com/playlist?id=1234567890
-https://music.163.com/#/playlist?id=1234567890
-
-# 专辑链接
-https://music.163.com/album?id=1234567890
-https://music.163.com/#/album?id=1234567890
-
-# 直接使用ID
-1234567890
+```bash
+mkdir -p data          # Linux 上还需要 chown 1000:1000 data
+cp cookie.example.txt data/cookie.txt   # 填入 MUSIC_U，或启动后在网页上扫码登录
+docker compose up -d
 ```
 
-## 🔌 API接口文档
+cookie、缓存和日志都在 `./data`。compose 默认只映射到 `127.0.0.1:5000`。
 
-### 基础信息
-- **Base URL**: `http://localhost:5000`
-- **请求方式**: GET / POST
-- **响应格式**: JSON
+## 安全建议
 
-### 接口列表
+- 服务只给自己用时保持默认的 `HOST=127.0.0.1`
+- 需要让其他设备访问时，**务必设置 `API_TOKEN`**，否则任何能访问该地址的人都能用你的会员账号下载，异常的调用量也可能让账号被风控
+- `cookie.txt`、`.env` 已在 `.gitignore` 和 `.dockerignore` 中，不要手动把它们提交或打包
 
-#### 1. 健康检查
-```http
-GET /health
-```
-**响应示例**:
-```json
-{
-  "status": "ok",
-  "message": "Service is running"
-}
-```
+## HTTP 接口
 
-#### 2. 歌曲搜索
-```http
-POST /search
-Content-Type: application/json
+完整说明见 [使用文档.md](使用文档.md)。常用接口：
 
-{
-  "keywords": "周杰伦 稻香",
-  "limit": 10
-}
-```
-**响应示例**:
-```json
-{
-  "code": 200,
-  "result": {
-    "songs": [
-      {
-        "id": 185668,
-        "name": "稻香",
-        "artists": ["周杰伦"],
-        "album": "魔杰座",
-        "duration": 223000
-      }
-    ]
-  }
-}
+| 接口 | 说明 |
+|---|---|
+| `GET /song?id=…&level=…&type=url\|json\|name\|lyric` | 歌曲链接 / 合并信息 / 详情 / 歌词 |
+| `GET /search?keyword=…&limit=30&offset=0&type=1` | 搜索 |
+| `GET /playlist?id=…&offset=0&limit=500` | 歌单（可分页） |
+| `GET /album?id=…` | 专辑 |
+| `POST /api/jobs` → `GET /api/jobs/<id>` → `GET /api/files/<id>/<level>` | 异步下载：创建任务、查询进度、取文件 |
+| `GET /download?id=…&quality=…&format=file\|json` | 同步下载（兼容旧版） |
+| `GET /api/status` | 登录状态、会员到期、缓存占用 |
+
+## 开发
+
+```bash
+pip install -r requirements-dev.txt
+pytest                      # 离线测试
+ruff check . && ruff format --check .
+NETEASE_COOKIE_FILE=/path/to/cookie.txt pytest -m live   # 在线测试，需要会员 cookie
 ```
 
-#### 3. 单曲解析
-```http
-POST /song
-Content-Type: application/json
+## 与上游相比的主要改动
 
-{
-  "id": "185668"
-}
-```
-
-#### 4. 歌单解析
-```http
-POST /playlist
-Content-Type: application/json
-
-{
-  "id": "123456789"
-}
-```
-
-#### 5. 专辑解析
-```http
-POST /album
-Content-Type: application/json
-
-{
-  "id": "123456789"
-}
-```
-
-#### 6. 音乐下载
-```http
-POST /download
-Content-Type: application/json
-
-{
-  "id": "185668",
-  "quality": "lossless"
-}
-```
-**响应**: 直接返回音频文件流
-
----
-
-## 音质参数说明（仅限单曲解析）
-
-- `standard`：标准音质
-- `exhigh`：极高音质
-- `lossless`：无损音质
-- `hires`：Hi-Res音质
-- `jyeffect`：高清环绕声
-- `sky`：沉浸环绕声
-- `jymaster`：超清母带
-
-> 黑胶VIP音质：standard, exhigh, lossless, hires, jyeffect  
-> 黑胶SVIP音质：sky, jymaster
-
----
-
-## Docker 一键部署
-
-1. **修改参数**
-
-   - 如需修改端口，请编辑 `.env` 或 `docker-compose.yml` 文件中的 `ports` 配置，例如：
-
-     ```yaml
-     ports:
-       - "8080:5000"
-     ```
-
-2. **启动服务**
-
-   ```bash
-   docker-compose up -d
-   ```
-
----
-
-## 在线演示
-
-[在线解析](https://wyapi.toubiec.cn/)
-
----
-
-## 注意事项
-
-- 必须使用黑胶会员账号的 Cookie 才能解析高音质资源。
-- Cookie 格式请严格按照 `cookie.txt` 示例填写。
-
----
+- **音质**：补全设备参数（`appver` 等）。浏览器复制的 cookie 不含 `appver`，原版因此会把 hires、jyeffect、sky、dolby、jymaster 全部静默降级为 lossless。现在会如实返回实际音质，并新增 `higher` 和 `vivid` 两档
+- **下载缓存**：原版按"歌手 - 歌名"判断是否已下载，会把别的音质、甚至同名的另一首歌当成缓存返回；并发下载同一首歌会写坏文件。现在按"歌曲 + 实际音质"缓存，先下载到临时文件，校验 md5 后再原子提交，并且同一首歌、同一音质同时只会下载一次
+- **元数据**：改用 mutagen 写标签，修正曲目总数、专辑艺人、FLAC 封面类型；新增歌词、日期、碟号、作曲作词；封面从数 MB 的 PNG 改为约 300KB 的 JPEG；Audio Vivid 文件也能写入标签
+- **文件名**：统一模板，非法字符转全角，浏览器保存的文件名与服务端一致
+- **接口**：拿不到链接时返回明确的错误码，不再出现 `success: true` 却没有 `url` 的情况；支持各种链接格式（短链接带 SSRF 防护）；搜索支持分页和类型；歌单接口支持隐私歌单，大歌单不再缺歌
+- **安全**：访问令牌、限流、默认只监听本机、修复前端 XSS、Docker 镜像不再打包 cookie
+- **其他**：修复无法使用的 `qr_login.py`；依赖升级到 Python 3.12 并修复 78 个已知漏洞；新增 117 个测试和 CI
 
 ## 致谢
 
+- [Suxiaoqinx/Netease_url](https://github.com/Suxiaoqinx/Netease_url)（上游项目）
 - [Ravizhan](https://github.com/ravizhan)
-
----
-
-## 反馈与交流
-
-- 在 Github [Issues](https://github.com/Suxiaoqinx/Netease_url/issues) 提交反馈
-- 或访问 [我的博客](https://www.toubiec.cn)
-
----
-
-欢迎 Star、Fork 和 PR！
-
-
-
+- [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)（设备参数与接口用法参考）
