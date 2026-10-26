@@ -1,721 +1,675 @@
-"""网易云音乐API模块
+"""网易云音乐接口客户端。
 
-提供网易云音乐相关API接口的封装，包括：
-- 音乐URL获取
-- 歌曲详情获取
-- 歌词获取
-- 搜索功能
-- 歌单和专辑详情
-- 二维码登录
+所有请求都经过 NeteaseClient：
+- cookie = 设备档案默认值（os=pc、appver 等）+ 用户 cookie（用户的值优先）。
+  appver 只有放在 cookie 里才会被服务端采用；缺少它时高于无损的音质会被静默降级。
+- eapi 接口自动加密，payload 里的 header 字段由合并后的 cookie 生成。
+- 网络错误、429 和 5xx 自动重试。
 """
 
+from __future__ import annotations
+
 import json
-import os
+import random
+import re
+import threading
 import time
 import urllib.parse
-from enum import Enum
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from hashlib import md5
-from random import randrange
+from http.cookiejar import DefaultCookiePolicy
+from pathlib import Path
 from typing import Any
 
 import requests
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-
-class QualityLevel(Enum):
-    """音质等级枚举"""
-
-    STANDARD = "standard"  # 标准音质
-    EXHIGH = "exhigh"  # 极高音质
-    LOSSLESS = "lossless"  # 无损音质
-    HIRES = "hires"  # Hi-Res音质
-    SKY = "sky"  # 沉浸环绕声
-    JYEFFECT = "jyeffect"  # 高清环绕声
-    JYMASTER = "jymaster"  # 超清母带
-    DOLBY = "dolby"  # 杜比全景声
-
-
-# 常量定义
-class APIConstants:
-    """API相关常量"""
-
-    AES_KEY = b"e82ckenh8dichen8"
-    USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/2.10.2.200154"
-    REFERER = "https://music.163.com/"
-
-    # API URLs
-    SONG_URL_V1 = "https://interface3.music.163.com/eapi/song/enhance/player/url/v1"
-    SONG_DETAIL_V3 = "https://interface3.music.163.com/api/v3/song/detail"
-    LYRIC_API = "https://interface3.music.163.com/api/song/lyric"
-    SEARCH_API = "https://music.163.com/api/cloudsearch/pc"
-    PLAYLIST_DETAIL_API = "https://music.163.com/api/v6/playlist/detail"
-    ALBUM_DETAIL_API = "https://music.163.com/api/v1/album/"
-    QR_UNIKEY_API = "https://interface3.music.163.com/eapi/login/qrcode/unikey"
-    QR_LOGIN_API = "https://interface3.music.163.com/eapi/login/qrcode/client/login"
-
-    # 默认配置
-    DEFAULT_CONFIG = {"os": "pc", "appver": "", "osver": "", "deviceId": "pyncm!"}
-
-    DEFAULT_COOKIES = {"os": "pc", "appver": "", "osver": "", "deviceId": "pyncm!"}
-
-
-class CryptoUtils:
-    """加密工具类"""
-
-    @staticmethod
-    def hex_digest(data: bytes) -> str:
-        """将字节数据转换为十六进制字符串"""
-        return "".join([hex(d)[2:].zfill(2) for d in data])
-
-    @staticmethod
-    def hash_digest(text: str) -> bytes:
-        """计算MD5哈希值"""
-        return md5(text.encode("utf-8")).digest()
-
-    @staticmethod
-    def hash_hex_digest(text: str) -> str:
-        """计算MD5哈希值并转换为十六进制字符串"""
-        return CryptoUtils.hex_digest(CryptoUtils.hash_digest(text))
-
-    @staticmethod
-    def encrypt_params(url: str, payload: dict[str, Any]) -> str:
-        """加密请求参数"""
-        url_path = urllib.parse.urlparse(url).path.replace("/eapi/", "/api/")
-        digest = CryptoUtils.hash_hex_digest(
-            f"nobody{url_path}use{json.dumps(payload)}md5forencrypt"
-        )
-        params = f"{url_path}-36cd479b6b5-{json.dumps(payload)}-36cd479b6b5-{digest}"
-
-        # AES加密
-        padder = padding.PKCS7(algorithms.AES(APIConstants.AES_KEY).block_size).padder()
-        padded_data = padder.update(params.encode()) + padder.finalize()
-        cipher = Cipher(algorithms.AES(APIConstants.AES_KEY), modes.ECB())
-        encryptor = cipher.encryptor()
-        enc = encryptor.update(padded_data) + encryptor.finalize()
-
-        return CryptoUtils.hex_digest(enc)
-
-
-class HTTPClient:
-    """HTTP客户端类"""
-
-    @staticmethod
-    def post_request(url: str, params: str, cookies: dict[str, str]) -> str:
-        """发送POST请求并返回文本响应"""
-        headers = {
-            "User-Agent": APIConstants.USER_AGENT,
-            "Referer": APIConstants.REFERER,
-        }
-
-        request_cookies = APIConstants.DEFAULT_COOKIES.copy()
-        request_cookies.update(cookies)
-
-        try:
-            response = requests.post(
-                url, headers=headers, cookies=request_cookies, data={"params": params}, timeout=30
-            )
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as e:
-            raise APIException(f"HTTP请求失败: {e}")
-
-    @staticmethod
-    def post_request_full(url: str, params: str, cookies: dict[str, str]) -> requests.Response:
-        """发送POST请求并返回完整响应对象"""
-        headers = {
-            "User-Agent": APIConstants.USER_AGENT,
-            "Referer": APIConstants.REFERER,
-        }
-
-        request_cookies = APIConstants.DEFAULT_COOKIES.copy()
-        request_cookies.update(cookies)
-
-        try:
-            response = requests.post(
-                url, headers=headers, cookies=request_cookies, data={"params": params}, timeout=30
-            )
-            response.raise_for_status()
-            return response
-        except requests.RequestException as e:
-            raise APIException(f"HTTP请求失败: {e}")
-
-
-class APIException(Exception):
-    """API异常类"""
-
-    pass
-
-
-class NeteaseAPI:
-    """网易云音乐API主类"""
-
-    def __init__(self):
-        self.http_client = HTTPClient()
-        self.crypto_utils = CryptoUtils()
-
-    def get_song_url(self, song_id: int, quality: str, cookies: dict[str, str]) -> dict[str, Any]:
-        """获取歌曲播放URL
-
-        Args:
-            song_id: 歌曲ID
-            quality: 音质等级 (standard, exhigh, lossless, hires, sky, jyeffect, jymaster)
-            cookies: 用户cookies
-
-        Returns:
-            包含歌曲URL信息的字典
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            config = APIConstants.DEFAULT_CONFIG.copy()
-            config["requestId"] = str(randrange(20000000, 30000000))
-
-            payload = {
-                "ids": [song_id],
-                "level": quality,
-                "encodeType": "mp4" if quality == "dolby" else "flac",
-                "header": json.dumps(config),
-            }
-
-            if quality == "sky":
-                payload["immerseType"] = "c51"
-
-            params = self.crypto_utils.encrypt_params(APIConstants.SONG_URL_V1, payload)
-            response_text = self.http_client.post_request(APIConstants.SONG_URL_V1, params, cookies)
-
-            result = json.loads(response_text)
-            if result.get("code") != 200:
-                raise APIException(f"获取歌曲URL失败: {result.get('message', '未知错误')}")
-
-            return result
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析响应数据失败: {e}")
-
-    def get_song_detail(self, song_id: int) -> dict[str, Any]:
-        """获取歌曲详细信息
-
-        Args:
-            song_id: 歌曲ID
-
-        Returns:
-            包含歌曲详细信息的字典
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            data = {"c": json.dumps([{"id": song_id, "v": 0}])}
-            response = requests.post(APIConstants.SONG_DETAIL_V3, data=data, timeout=30)
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") != 200:
-                raise APIException(f"获取歌曲详情失败: {result.get('message', '未知错误')}")
-
-            return result
-        except requests.RequestException as e:
-            raise APIException(f"获取歌曲详情请求失败: {e}")
-        except json.JSONDecodeError as e:
-            raise APIException(f"解析歌曲详情响应失败: {e}")
-
-    def get_lyric(self, song_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-        """获取歌词信息
-
-        Args:
-            song_id: 歌曲ID
-            cookies: 用户cookies
-
-        Returns:
-            包含歌词信息的字典
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            data = {
-                "id": song_id,
-                "cp": "false",
-                "tv": "0",
-                "lv": "0",
-                "rv": "0",
-                "kv": "0",
-                "yv": "0",
-                "ytv": "0",
-                "yrv": "0",
-            }
-
-            headers = {"User-Agent": APIConstants.USER_AGENT, "Referer": APIConstants.REFERER}
-
-            response = requests.post(
-                APIConstants.LYRIC_API, data=data, headers=headers, cookies=cookies, timeout=30
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") != 200:
-                raise APIException(f"获取歌词失败: {result.get('message', '未知错误')}")
-
-            return result
-        except requests.RequestException as e:
-            raise APIException(f"获取歌词请求失败: {e}")
-        except json.JSONDecodeError as e:
-            raise APIException(f"解析歌词响应失败: {e}")
-
-    def search_music(
-        self, keywords: str, cookies: dict[str, str], limit: int = 10
-    ) -> list[dict[str, Any]]:
-        """搜索音乐
-
-        Args:
-            keywords: 搜索关键词
-            cookies: 用户cookies
-            limit: 返回数量限制
-
-        Returns:
-            歌曲信息列表
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            data = {"s": keywords, "type": 1, "limit": limit}
-            headers = {"User-Agent": APIConstants.USER_AGENT, "Referer": APIConstants.REFERER}
-
-            response = requests.post(
-                APIConstants.SEARCH_API, data=data, headers=headers, cookies=cookies, timeout=30
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") != 200:
-                raise APIException(f"搜索失败: {result.get('message', '未知错误')}")
-
-            songs = []
-            for item in result.get("result", {}).get("songs", []):
-                song_info = {
-                    "id": item["id"],
-                    "name": item["name"],
-                    "artists": "/".join(artist["name"] for artist in item["ar"]),
-                    "album": item["al"]["name"],
-                    "picUrl": item["al"]["picUrl"],
-                }
-                songs.append(song_info)
-
-            return songs
-        except requests.RequestException as e:
-            raise APIException(f"搜索请求失败: {e}")
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析搜索响应失败: {e}")
-
-    def get_playlist_detail(self, playlist_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-        """获取歌单详情
-
-        Args:
-            playlist_id: 歌单ID
-            cookies: 用户cookies
-
-        Returns:
-            歌单详情信息
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            data = {"id": playlist_id}
-            headers = {"User-Agent": APIConstants.USER_AGENT, "Referer": APIConstants.REFERER}
-
-            response = requests.post(
-                APIConstants.PLAYLIST_DETAIL_API,
-                data=data,
-                headers=headers,
-                cookies=cookies,
-                timeout=30,
-            )
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") != 200:
-                raise APIException(f"获取歌单详情失败: {result.get('message', '未知错误')}")
-
-            playlist = result.get("playlist", {})
-            info = {
-                "id": playlist.get("id"),
-                "name": playlist.get("name"),
-                "coverImgUrl": playlist.get("coverImgUrl"),
-                "creator": playlist.get("creator", {}).get("nickname", ""),
-                "trackCount": playlist.get("trackCount"),
-                "description": playlist.get("description", ""),
-                "tracks": [],
-            }
-
-            # 获取所有trackIds并分批获取详细信息
-            track_ids = [str(t["id"]) for t in playlist.get("trackIds", [])]
-            for i in range(0, len(track_ids), 100):
-                batch_ids = track_ids[i : i + 100]
-                song_data = {"c": json.dumps([{"id": int(sid), "v": 0} for sid in batch_ids])}
-
-                song_resp = requests.post(
-                    APIConstants.SONG_DETAIL_V3,
-                    data=song_data,
-                    headers=headers,
-                    cookies=cookies,
-                    timeout=30,
-                )
-                song_resp.raise_for_status()
-
-                song_result = song_resp.json()
-                for song in song_result.get("songs", []):
-                    info["tracks"].append(
-                        {
-                            "id": song["id"],
-                            "name": song["name"],
-                            "artists": "/".join(artist["name"] for artist in song["ar"]),
-                            "album": song["al"]["name"],
-                            "picUrl": song["al"]["picUrl"],
-                        }
-                    )
-
-            return info
-        except requests.RequestException as e:
-            raise APIException(f"获取歌单详情请求失败: {e}")
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析歌单详情响应失败: {e}")
-
-    def get_album_detail(self, album_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-        """获取专辑详情
-
-        Args:
-            album_id: 专辑ID
-            cookies: 用户cookies
-
-        Returns:
-            专辑详情信息
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            url = f"{APIConstants.ALBUM_DETAIL_API}{album_id}"
-            headers = {"User-Agent": APIConstants.USER_AGENT, "Referer": APIConstants.REFERER}
-
-            response = requests.get(url, headers=headers, cookies=cookies, timeout=30)
-            response.raise_for_status()
-
-            result = response.json()
-            if result.get("code") != 200:
-                raise APIException(f"获取专辑详情失败: {result.get('message', '未知错误')}")
-
-            album = result.get("album", {})
-            info = {
-                "id": album.get("id"),
-                "name": album.get("name"),
-                "coverImgUrl": self.get_pic_url(album.get("pic")),
-                "artist": album.get("artist", {}).get("name", ""),
-                "publishTime": album.get("publishTime"),
-                "description": album.get("description", ""),
-                "songs": [],
-            }
-
-            for song in result.get("songs", []):
-                info["songs"].append(
-                    {
-                        "id": song["id"],
-                        "name": song["name"],
-                        "artists": "/".join(artist["name"] for artist in song["ar"]),
-                        "album": song["al"]["name"],
-                        "picUrl": self.get_pic_url(song["al"].get("pic")),
-                    }
-                )
-
-            return info
-        except requests.RequestException as e:
-            raise APIException(f"获取专辑详情请求失败: {e}")
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析专辑详情响应失败: {e}")
-
-    def netease_encrypt_id(self, id_str: str) -> str:
-        """网易云加密图片ID算法
-
-        Args:
-            id_str: 图片ID字符串
-
-        Returns:
-            加密后的字符串
-        """
-        import base64
-        import hashlib
-
-        magic = list("3go8&$8*3*3h0k(2)2")
-        song_id = list(id_str)
-
-        for i in range(len(song_id)):
-            song_id[i] = chr(ord(song_id[i]) ^ ord(magic[i % len(magic)]))
-
-        m = "".join(song_id)
-        md5_bytes = hashlib.md5(m.encode("utf-8")).digest()
-        result = base64.b64encode(md5_bytes).decode("utf-8")
-        result = result.replace("/", "_").replace("+", "-")
-
-        return result
-
-    def get_pic_url(self, pic_id: int | None, size: int = 300) -> str:
-        """获取网易云加密歌曲/专辑封面直链
-
-        Args:
-            pic_id: 封面ID
-            size: 图片尺寸
-
-        Returns:
-            图片URL
-        """
-        if pic_id is None:
-            return ""
-
-        enc_id = self.netease_encrypt_id(str(pic_id))
-        return f"https://p3.music.126.net/{enc_id}/{pic_id}.jpg?param={size}y{size}"
-
-
-class QRLoginManager:
-    """二维码登录管理器"""
-
-    def __init__(self):
-        self.http_client = HTTPClient()
-        self.crypto_utils = CryptoUtils()
-
-    def generate_qr_key(self) -> str | None:
-        """生成二维码的key
-
-        Returns:
-            成功返回unikey，失败返回None
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            config = APIConstants.DEFAULT_CONFIG.copy()
-            config["requestId"] = str(randrange(20000000, 30000000))
-
-            payload = {"type": 1, "header": json.dumps(config)}
-
-            params = self.crypto_utils.encrypt_params(APIConstants.QR_UNIKEY_API, payload)
-            response = self.http_client.post_request_full(APIConstants.QR_UNIKEY_API, params, {})
-
-            result = json.loads(response.text)
-            if result.get("code") == 200:
-                return result.get("unikey")
-            else:
-                raise APIException(f"生成二维码key失败: {result.get('message', '未知错误')}")
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析二维码key响应失败: {e}")
-
-    def create_qr_login(self) -> str | None:
-        """创建登录二维码并在控制台显示
-
-        Returns:
-            成功返回unikey，失败返回None
-        """
-        try:
-            import qrcode
-
-            unikey = self.generate_qr_key()
-            if not unikey:
-                print("生成二维码key失败")
-                return None
-
-            # 创建二维码
-            qr = qrcode.QRCode()
-            qr.add_data(f"https://music.163.com/login?codekey={unikey}")
-            qr.make(fit=True)
-
-            # 在控制台显示二维码
-            qr.print_ascii(tty=True)
-            print("\n请使用网易云音乐APP扫描上方二维码登录")
-            return unikey
-        except ImportError:
-            print("请安装qrcode库: pip install qrcode")
-            return None
-        except Exception as e:
-            print(f"创建二维码失败: {e}")
-            return None
-
-    def check_qr_login(self, unikey: str) -> tuple[int, dict[str, str]]:
-        """检查二维码登录状态
-
-        Args:
-            unikey: 二维码key
-
-        Returns:
-            (登录状态码, cookie字典)
-
-        Raises:
-            APIException: API调用失败时抛出
-        """
-        try:
-            config = APIConstants.DEFAULT_CONFIG.copy()
-            config["requestId"] = str(randrange(20000000, 30000000))
-
-            payload = {"key": unikey, "type": 1, "header": json.dumps(config)}
-
-            params = self.crypto_utils.encrypt_params(APIConstants.QR_LOGIN_API, payload)
-            response = self.http_client.post_request_full(APIConstants.QR_LOGIN_API, params, {})
-
-            result = json.loads(response.text)
-            cookie_dict = {}
-
-            if result.get("code") == 803:
-                # 登录成功，提取cookie
-                all_cookies = response.headers.get("Set-Cookie", "").split(", ")
-                for cookie_str in all_cookies:
-                    if "MUSIC_U=" in cookie_str:
-                        cookie_dict["MUSIC_U"] = cookie_str.split("MUSIC_U=")[1].split(";")[0]
-
-            return result.get("code", -1), cookie_dict
-        except (json.JSONDecodeError, KeyError) as e:
-            raise APIException(f"解析登录状态响应失败: {e}")
-
-    def qr_login(self) -> str | None:
-        """完整的二维码登录流程
-
-        Returns:
-            成功返回cookie字符串，失败返回None
-        """
-        try:
-            unikey = self.create_qr_login()
-            if not unikey:
-                return None
-
-            while True:
-                code, cookies = self.check_qr_login(unikey)
-
-                if code == 803:
-                    print("\n登录成功！")
-                    return f"MUSIC_U={cookies['MUSIC_U']};os=pc;appver=8.9.70;"
-                elif code == 801:
-                    print("\r等待扫码...", end="")
-                elif code == 802:
-                    print("\r扫码成功，请在手机上确认登录...", end="")
-                else:
-                    print(f"\n登录失败，错误码：{code}")
-                    return None
-
-                time.sleep(2)
-        except KeyboardInterrupt:
-            print("\n用户取消登录")
-            return None
-        except Exception as e:
-            print(f"\n登录过程中发生错误: {e}")
-            return None
-
-
-# 向后兼容的函数接口
-def url_v1(song_id: int, level: str, cookies: dict[str, str]) -> dict[str, Any]:
-    """获取歌曲URL（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_song_url(song_id, level, cookies)
-
-
-def name_v1(song_id: int) -> dict[str, Any]:
-    """获取歌曲详情（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_song_detail(song_id)
-
-
-def lyric_v1(song_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-    """获取歌词（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_lyric(song_id, cookies)
-
-
-def search_music(keywords: str, cookies: dict[str, str], limit: int = 10) -> list[dict[str, Any]]:
-    """搜索音乐（向后兼容）"""
-    api = NeteaseAPI()
-    return api.search_music(keywords, cookies, limit)
-
-
-def playlist_detail(playlist_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-    """获取歌单详情（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_playlist_detail(playlist_id, cookies)
-
-
-def album_detail(album_id: int, cookies: dict[str, str]) -> dict[str, Any]:
-    """获取专辑详情（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_album_detail(album_id, cookies)
-
-
-def get_pic_url(pic_id: int | None, size: int = 300) -> str:
-    """获取图片URL（向后兼容）"""
-    api = NeteaseAPI()
-    return api.get_pic_url(pic_id, size)
-
-
-def qr_login() -> str | None:
-    """二维码登录（向后兼容）"""
-    manager = QRLoginManager()
-    return manager.qr_login()
-
-
-# ============ Cookie 工具 ============
-
-DEFAULT_COOKIE_FILE = "cookie.txt"
-
-
-def load_cookies(path: str = DEFAULT_COOKIE_FILE) -> dict[str, str]:
-    """从 cookie.txt 直接读取并解析为 dict
-
-    支持标准 ``NMTID=xxx; _ntes_nnid=xxx; ...`` 格式。
-    文件不存在或解析失败返回空 dict（不抛异常，调用方决定如何处理）。
-    """
-    if not os.path.isfile(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            content = f.read().strip()
-    except OSError:
-        return {}
-    return parse_cookie_string(content)
-
-
-def parse_cookie_string(cookie_string: str) -> dict[str, str]:
-    """把 ``k1=v1; k2=v2`` 格式字符串解析为 dict
-
-    支持 ``;`` 或 ``\\n`` 作为分隔符。
-    """
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from levels import get_level, level_name
+from utils import TTLCache, atomic_write_text
+
+EAPI_BASE = "https://interface3.music.163.com/eapi"
+API_BASE = "https://interface3.music.163.com/api"
+WEB_BASE = "https://music.163.com"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/2.10.2.200154"
+)
+REFERER = "https://music.163.com/"
+EAPI_KEY = b"e82ckenh8dichen8"
+
+# 与 NeteaseCloudMusicApi Enhanced 的设备档案保持一致
+DEVICE_PROFILES: dict[str, dict[str, str]] = {
+    "pc": {
+        "os": "pc",
+        "appver": "3.1.17.204416",
+        "osver": "Microsoft-Windows-10-Professional-build-19045-64bit",
+        "channel": "netease",
+    },
+    "android": {
+        "os": "android",
+        "appver": "8.20.20.231215173437",
+        "osver": "14",
+        "channel": "xiaomi",
+    },
+}
+
+# url 接口返回的 type -> 文件扩展名（MP4 容器的纯音频按惯例用 .m4a）
+EXT_BY_TYPE = {
+    "mp3": ".mp3",
+    "flac": ".flac",
+    "mp4": ".m4a",
+    "m4a": ".m4a",
+    "av3a": ".m4a",
+    "eac3": ".m4a",
+    "ec3": ".m4a",
+    "ogg": ".ogg",
+    "opus": ".opus",
+}
+
+URL_ERRORS = {
+    "TRIAL_ONLY": "只能获取试听片段（需要会员或购买）",
+    "NEED_VIP_OR_PURCHASE": "无权获取：需要会员或购买，或该歌曲不提供此音质",
+    "UNAVAILABLE": "歌曲已下架或暂无版权",
+    "NO_URL": "未获取到播放链接",
+}
+
+
+class NeteaseError(Exception):
+    """网易云接口调用失败（网络错误、HTTP 错误或业务 code 非 200）。"""
+
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+APIException = NeteaseError  # 兼容旧名称
+
+
+# ============ eapi 加密 ============
+
+
+def eapi_encrypt(url: str, payload: Mapping[str, Any]) -> str:
+    """eapi 参数加密：AES-128-ECB(path-36cd479b6b5-json-36cd479b6b5-md5)。"""
+    path = urllib.parse.urlparse(url).path.replace("/eapi/", "/api/")
+    text = json.dumps(payload)
+    digest = md5(f"nobody{path}use{text}md5forencrypt".encode()).hexdigest()
+    plain = f"{path}-36cd479b6b5-{text}-36cd479b6b5-{digest}".encode()
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plain) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(EAPI_KEY), modes.ECB()).encryptor()
+    return (encryptor.update(padded) + encryptor.finalize()).hex()
+
+
+# ============ Cookie ============
+
+
+def parse_cookie_string(cookie_string: str | None) -> dict[str, str]:
+    """把 ``k1=v1; k2=v2``（可跨行，可带 ``Cookie:`` 前缀）解析为 dict。"""
     cookies: dict[str, str] = {}
     if not cookie_string:
         return cookies
-    cookie_string = cookie_string.strip()
-    if not cookie_string:
-        return cookies
-    for sep in (";", "\n"):
-        if sep in cookie_string:
-            pairs = cookie_string.split(sep)
-            break
-    else:
-        pairs = [cookie_string]
-    for pair in pairs:
-        pair = pair.strip()
-        if not pair or "=" not in pair:
+    text = cookie_string.strip()
+    if text.lower().startswith("cookie:"):
+        text = text[7:]
+    for pair in re.split(r"[;\r\n]", text):
+        if "=" not in pair:
             continue
         key, value = pair.split("=", 1)
-        key = key.strip()
-        value = value.strip()
+        key, value = key.strip(), value.strip()
         if key and value:
             cookies[key] = value
     return cookies
 
 
-if __name__ == "__main__":
-    # 测试代码
-    print("网易云音乐API模块")
-    print("支持的功能:")
-    print("- 歌曲URL获取")
-    print("- 歌曲详情获取")
-    print("- 歌词获取")
-    print("- 音乐搜索")
-    print("- 歌单详情")
-    print("- 专辑详情")
-    print("- 二维码登录")
+def load_cookies(path: str | Path = "cookie.txt") -> dict[str, str]:
+    """读取 cookie 文件；文件不存在或读取失败时返回空 dict。"""
+    try:
+        return parse_cookie_string(Path(path).read_text(encoding="utf-8-sig"))
+    except OSError:
+        return {}
+
+
+class CookieStore:
+    """cookie 文件的读写。按 mtime 缓存，修改文件后无需重启即可生效。"""
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._stamp: tuple[int, int] | None = None
+        self._cookies: dict[str, str] = {}
+
+    def get(self) -> dict[str, str]:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return {}
+        stamp = (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            if stamp != self._stamp:
+                self._cookies = load_cookies(self.path)
+                self._stamp = stamp
+            return dict(self._cookies)
+
+    def save(self, cookies: Mapping[str, str]) -> None:
+        atomic_write_text(self.path, "; ".join(f"{k}={v}" for k, v in cookies.items()) + "\n")
+
+    def clear(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+# ============ 数据结构 ============
+
+
+@dataclass
+class TrackSource:
+    """一次 url 请求的结果：请求的音质、实际得到的音质和文件信息。"""
+
+    song_id: int
+    requested_level: str
+    level: str | None
+    url: str | None
+    type: str | None
+    ext: str | None
+    size: int
+    md5: str | None
+    bitrate: int
+    sample_rate: int
+    duration_ms: int
+    expires_at: float
+    is_trial: bool
+    code: int
+
+    @classmethod
+    def from_api(cls, item: Mapping[str, Any], requested_level: str) -> TrackSource:
+        type_ = (item.get("type") or "").lower() or None
+        return cls(
+            song_id=int(item.get("id") or 0),
+            requested_level=requested_level,
+            level=item.get("level") or None,
+            url=item.get("url") or None,
+            type=type_,
+            ext=EXT_BY_TYPE.get(type_ or ""),
+            size=int(item.get("size") or 0),
+            md5=(item.get("md5") or "").lower() or None,
+            bitrate=int(item.get("br") or 0),
+            sample_rate=int(item.get("sr") or 0),
+            duration_ms=int(item.get("time") or 0),
+            expires_at=time.time() + int(item.get("expi") or 1200),
+            is_trial=bool(item.get("freeTrialInfo")),
+            code=int(item.get("code") or 0),
+        )
+
+    @property
+    def available(self) -> bool:
+        return bool(self.url) and not self.is_trial
+
+    @property
+    def downgraded(self) -> bool:
+        return self.available and self.level != self.requested_level
+
+    @property
+    def error_code(self) -> str | None:
+        if self.available:
+            return None
+        if self.is_trial:
+            return "TRIAL_ONLY"
+        if self.code == -110:
+            return "NEED_VIP_OR_PURCHASE"
+        if self.code == 404:
+            return "UNAVAILABLE"
+        return "NO_URL"
+
+    @property
+    def error_message(self) -> str | None:
+        code = self.error_code
+        return URL_ERRORS[code] if code else None
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d.update(
+            available=self.available,
+            downgraded=self.downgraded,
+            quality_name=level_name(self.level),
+            requested_quality_name=level_name(self.requested_level),
+            error_code=self.error_code,
+            error_message=self.error_message,
+            expires_in=max(0, int(self.expires_at - time.time())),
+        )
+        d.pop("expires_at")
+        return d
+
+
+@dataclass
+class Lyrics:
+    lrc: str = ""
+    tlyric: str = ""
+    romalrc: str = ""
+    no_lyrics: bool = False
+
+
+def _artist_names(items: list[Mapping[str, Any]] | None) -> list[str]:
+    return [a.get("name") or "" for a in items or [] if a.get("name")]
+
+
+def song_brief(song: Mapping[str, Any]) -> dict[str, Any]:
+    """列表展示用的歌曲摘要（字段名与旧版前端兼容）。"""
+    al = song.get("al") or song.get("album") or {}
+    artists = _artist_names(song.get("ar") or song.get("artists"))
+    return {
+        "id": song.get("id"),
+        "name": song.get("name") or "",
+        "artists": "/".join(artists),
+        "artist_list": artists,
+        "album": al.get("name") or "",
+        "album_id": al.get("id"),
+        "picUrl": al.get("picUrl") or "",
+        "duration": song.get("dt") or song.get("duration") or 0,
+    }
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    m = re.search(r"\d+", str(value or ""))
+    return int(m.group()) if m else default
+
+
+# ============ 客户端 ============
+
+
+class NeteaseClient:
+    def __init__(
+        self,
+        cookies: CookieStore | Mapping[str, str] | None = None,
+        *,
+        os_name: str = "pc",
+        appver: str = "",
+        device_id: str = "pyncm!",
+        timeout: tuple[float, float] = (5, 30),
+    ):
+        if isinstance(cookies, CookieStore):
+            self._cookie_source = cookies.get
+        else:
+            fixed = dict(cookies or {})
+            self._cookie_source = lambda: dict(fixed)
+        profile = dict(DEVICE_PROFILES.get(os_name, DEVICE_PROFILES["pc"]))
+        if appver:
+            profile["appver"] = appver
+        profile["deviceId"] = device_id
+        self.device = profile
+        self.timeout = timeout
+        self.session = requests.Session()
+        # cookie 由我们显式拼接；不让响应的 Set-Cookie 污染共享的 session
+        self.session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        retry = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=None,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=32)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self._album_cache = TTLCache(ttl=600, maxsize=256)
+
+    @classmethod
+    def from_settings(cls, settings) -> NeteaseClient:
+        return cls(
+            CookieStore(settings.cookie_file),
+            os_name=settings.netease_os,
+            appver=settings.netease_appver,
+            device_id=settings.netease_device_id,
+        )
+
+    # ----------- 底层请求 -----------
+
+    def user_cookies(self) -> dict[str, str]:
+        return self._cookie_source()
+
+    def cookies(self, force: Mapping[str, str] | None = None) -> dict[str, str]:
+        """设备默认值 < 用户 cookie < 强制覆盖（如 vivid 的 Android 身份）。"""
+        merged = {**self.device, **self.user_cookies()}
+        if force:
+            merged.update(force)
+        return merged
+
+    def _send(
+        self, method: str, url: str, cookies: Mapping[str, str], **kwargs
+    ) -> requests.Response:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": REFERER,
+            "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+        }
+        try:
+            resp = self.session.request(
+                method, url, headers=headers, timeout=self.timeout, **kwargs
+            )
+        except requests.RequestException as e:
+            raise NeteaseError(f"请求网易云接口失败: {e.__class__.__name__}") from e
+        if resp.status_code != 200:
+            raise NeteaseError(f"网易云接口返回 HTTP {resp.status_code}", resp.status_code)
+        return resp
+
+    @staticmethod
+    def _json(resp: requests.Response, *, check: bool = True) -> dict[str, Any]:
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise NeteaseError("网易云接口返回的不是 JSON") from e
+        if check and data.get("code") != 200:
+            message = data.get("message") or data.get("msg") or "未知错误"
+            raise NeteaseError(f"网易云接口错误: {message}", data.get("code"))
+        return data
+
+    def _eapi_header(self, cookies: Mapping[str, str]) -> dict[str, str]:
+        header = {
+            "osver": cookies.get("osver", ""),
+            "deviceId": cookies.get("deviceId", ""),
+            "os": cookies.get("os", ""),
+            "appver": cookies.get("appver", ""),
+            "versioncode": cookies.get("versioncode", "140"),
+            "mobilename": cookies.get("mobilename", ""),
+            "buildver": cookies.get("buildver", str(int(time.time()))),
+            "resolution": cookies.get("resolution", "1920x1080"),
+            "__csrf": cookies.get("__csrf", ""),
+            "channel": cookies.get("channel", ""),
+            "requestId": f"{int(time.time() * 1000)}_{random.randint(0, 999):04d}",
+        }
+        for key in ("MUSIC_U", "MUSIC_A"):
+            if cookies.get(key):
+                header[key] = cookies[key]
+        return header
+
+    def eapi_response(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        force_device: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        cookies = self.cookies(force_device)
+        url = EAPI_BASE + path
+        body = dict(payload)
+        body["header"] = json.dumps(self._eapi_header(cookies))
+        return self._send("POST", url, cookies, data={"params": eapi_encrypt(url, body)})
+
+    def eapi(self, path: str, payload: Mapping[str, Any], **kwargs) -> dict[str, Any]:
+        return self._json(self.eapi_response(path, payload, **kwargs))
+
+    def api(
+        self, url: str, data: Mapping[str, Any] | None = None, *, check: bool = True
+    ) -> dict[str, Any]:
+        return self._json(self._send("POST", url, self.cookies(), data=data or {}), check=check)
+
+    def api_get(self, url: str, *, check: bool = True) -> dict[str, Any]:
+        return self._json(self._send("GET", url, self.cookies()), check=check)
+
+    # ----------- 歌曲 -----------
+
+    def song_url_raw(self, song_id: int, level: str) -> dict[str, Any]:
+        lv = get_level(level)
+        payload: dict[str, Any] = {
+            "ids": [int(song_id)],
+            "level": lv.key,
+            "encodeType": lv.encode_type,
+        }
+        if lv.immerse_type:
+            payload["immerseType"] = lv.immerse_type
+        return self.eapi(
+            "/song/enhance/player/url/v1", payload, force_device=lv.force_device or None
+        )
+
+    def song_url(self, song_id: int, level: str) -> TrackSource:
+        data = self.song_url_raw(song_id, level).get("data") or []
+        if not data:
+            return TrackSource.from_api({"id": song_id, "code": 404}, level)
+        return TrackSource.from_api(data[0], level)
+
+    def song_details_raw(self, ids: list[int]) -> dict[str, Any]:
+        c = json.dumps([{"id": int(i)} for i in ids])
+        return self.api(f"{API_BASE}/v3/song/detail", {"c": c})
+
+    def song_details(
+        self, ids: list[int], *, batch: int = 500, workers: int = 4
+    ) -> list[dict[str, Any]]:
+        """批量获取歌曲详情，按传入顺序返回（已下架等无详情的歌曲会被跳过）。"""
+        ids = [int(i) for i in ids]
+        chunks = [ids[i : i + batch] for i in range(0, len(ids), batch)]
+        if len(chunks) <= 1:
+            results = [self.song_details_raw(c) for c in chunks]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(self.song_details_raw, chunks))
+        by_id: dict[int, dict[str, Any]] = {}
+        for res in results:
+            privileges = {p.get("id"): p for p in res.get("privileges") or []}
+            for song in res.get("songs") or []:
+                song = dict(song)
+                song["privilege"] = privileges.get(song.get("id"), {})
+                by_id[song["id"]] = song
+        return [by_id[i] for i in ids if i in by_id]
+
+    def song_detail(self, song_id: int) -> dict[str, Any]:
+        songs = self.song_details([song_id])
+        if not songs:
+            raise NeteaseError("未找到这首歌曲", 404)
+        return songs[0]
+
+    def lyric_raw(self, song_id: int) -> dict[str, Any]:
+        data = {"id": int(song_id), "cp": "false", "tv": "0", "lv": "0", "rv": "0", "kv": "0",
+                "yv": "0", "ytv": "0", "yrv": "0"}  # fmt: skip
+        return self.api(f"{API_BASE}/song/lyric", data)
+
+    def lyrics(self, song_id: int) -> Lyrics:
+        raw = self.lyric_raw(song_id)
+
+        def text(key: str) -> str:
+            return ((raw.get(key) or {}).get("lyric") or "").strip()
+
+        no_lyrics = bool(raw.get("nolyric") or raw.get("uncollected") or raw.get("pureMusic"))
+        return Lyrics(text("lrc"), text("tlyric"), text("romalrc"), no_lyrics)
+
+    # ----------- 搜索 / 歌单 / 专辑 -----------
+
+    SEARCH_TYPES = {1: "songs", 10: "albums", 100: "artists", 1000: "playlists"}
+
+    def search(
+        self, keyword: str, *, type: int = 1, limit: int = 30, offset: int = 0
+    ) -> dict[str, Any]:
+        if type not in self.SEARCH_TYPES:
+            raise ValueError(
+                f"不支持的搜索类型: {type}，可选: 1 单曲 / 10 专辑 / 100 歌手 / 1000 歌单"
+            )
+        raw = self.api(f"{WEB_BASE}/api/cloudsearch/pc",
+                       {"s": keyword, "type": type, "limit": limit, "offset": offset})  # fmt: skip
+        result = raw.get("result") or {}
+        key = self.SEARCH_TYPES[type]
+        items = result.get(key) or []
+        if type == 1:
+            items = [song_brief(s) for s in items]
+        elif type == 10:
+            items = [
+                {
+                    "id": a.get("id"),
+                    "name": a.get("name"),
+                    "picUrl": a.get("picUrl"),
+                    "artist": (a.get("artist") or {}).get("name", ""),
+                    "size": a.get("size"),
+                    "publishTime": a.get("publishTime"),
+                }
+                for a in items
+            ]
+        elif type == 100:
+            items = [
+                {"id": a.get("id"), "name": a.get("name"), "picUrl": a.get("picUrl"),
+                 "albumSize": a.get("albumSize"), "musicSize": a.get("musicSize")}
+                for a in items
+            ]  # fmt: skip
+        else:
+            items = [
+                {
+                    "id": p.get("id"),
+                    "name": p.get("name"),
+                    "coverImgUrl": p.get("coverImgUrl"),
+                    "trackCount": p.get("trackCount"),
+                    "creator": (p.get("creator") or {}).get("nickname", ""),
+                }
+                for p in items
+            ]
+        total_key = {1: "songCount", 10: "albumCount", 100: "artistCount", 1000: "playlistCount"}[
+            type
+        ]
+        return {"type": type, "total": int(result.get(total_key) or 0), "items": items}
+
+    def playlist(
+        self, playlist_id: int, *, offset: int = 0, limit: int | None = None
+    ) -> dict[str, Any]:
+        raw = self.api(
+            f"{WEB_BASE}/api/v6/playlist/detail", {"id": int(playlist_id), "n": 100000, "s": 8}
+        )
+        pl = raw.get("playlist") or {}
+        track_ids = [t["id"] for t in pl.get("trackIds") or []]
+        end = None if limit is None else offset + limit
+        page_ids = track_ids[offset:end]
+        tracks = [song_brief(s) for s in self.song_details(page_ids)] if page_ids else []
+        return {
+            "id": pl.get("id"),
+            "name": pl.get("name"),
+            "coverImgUrl": pl.get("coverImgUrl"),
+            "creator": (pl.get("creator") or {}).get("nickname", ""),
+            "trackCount": pl.get("trackCount"),
+            "description": pl.get("description") or "",
+            "total": len(track_ids),
+            "offset": offset,
+            "limit": limit,
+            "unavailable": len(page_ids) - len(tracks),
+            "tracks": tracks,
+        }
+
+    def album_raw(self, album_id: int) -> dict[str, Any]:
+        return self._album_cache.get_or_set(
+            int(album_id), lambda: self.api_get(f"{WEB_BASE}/api/v1/album/{int(album_id)}")
+        )
+
+    def album(self, album_id: int) -> dict[str, Any]:
+        raw = self.album_raw(album_id)
+        al = raw.get("album") or {}
+        artists = _artist_names(al.get("artists")) or _artist_names([al.get("artist") or {}])
+        return {
+            "id": al.get("id"),
+            "name": al.get("name"),
+            "coverImgUrl": al.get("picUrl") or "",
+            "artist": "/".join(artists),
+            "artists": artists,
+            "publishTime": al.get("publishTime"),
+            "company": al.get("company") or "",
+            "description": al.get("description") or "",
+            "size": al.get("size"),
+            "songs": [song_brief(s) for s in raw.get("songs") or []],
+        }
+
+    def album_tag_info(self, album_id: int) -> dict[str, Any]:
+        """写标签需要的专辑信息：专辑艺人、曲目总数、碟数、发行时间、唱片公司。"""
+        raw = self.album_raw(album_id)
+        al = raw.get("album") or {}
+        songs = raw.get("songs") or []
+        discs = {_as_int(s.get("cd"), 1) for s in songs} or {1}
+        return {
+            "name": al.get("name") or "",
+            "artists": _artist_names(al.get("artists")) or _artist_names([al.get("artist") or {}]),
+            "track_total": int(al.get("size") or len(songs) or 0),
+            "disc_total": max(discs),
+            "publish_time": al.get("publishTime") or 0,
+            "company": al.get("company") or "",
+        }
+
+    # ----------- 账号 -----------
+
+    def account(self) -> dict[str, Any]:
+        raw = self.api(f"{WEB_BASE}/api/nuser/account/get")
+        account = raw.get("account") or {}
+        profile = raw.get("profile") or {}
+        return {
+            "logged_in": bool(account.get("id")) and bool(profile),
+            "user_id": account.get("id"),
+            "nickname": profile.get("nickname"),
+            "vip_type": account.get("vipType"),
+        }
+
+    def vip_info(self) -> dict[str, Any]:
+        raw = self.api(f"{WEB_BASE}/api/music-vip-membership/client/vip/info")
+        data = raw.get("data") or {}
+        now_ms = time.time() * 1000
+
+        def expire(key: str) -> int | None:
+            item = data.get(key) or {}
+            ts = item.get("expireTime") or 0
+            return ts if item.get("vipCode") and ts > now_ms else None
+
+        return {
+            "svip_expire": expire("redplus"),
+            "vip_expire": expire("associator"),
+            "music_package_expire": expire("musicPackage"),
+            "red_vip_level": data.get("redVipLevel"),
+        }
+
+    # ----------- 二维码登录 -----------
+
+    def qr_unikey(self) -> str:
+        data = self.eapi("/login/qrcode/unikey", {"type": 1})
+        key = data.get("unikey")
+        if not key:
+            raise NeteaseError("生成二维码失败：未返回 unikey")
+        return key
+
+    def qr_check(self, key: str) -> dict[str, Any]:
+        """返回 {code, message, cookies}；code 800 过期、801 待扫码、802 待确认、803 成功。"""
+        resp = self.eapi_response("/login/qrcode/client/login", {"key": key, "type": 1})
+        data = self._json(resp, check=False)
+        code = data.get("code")
+        cookies = {c.name: c.value for c in resp.cookies if c.value} if code == 803 else {}
+        return {
+            "code": code,
+            "message": data.get("message") or "",
+            "nickname": data.get("nickname"),
+            "cookies": cookies,
+        }
+
+
+def qr_login_url(key: str) -> str:
+    return f"https://music.163.com/login?codekey={key}"
+
+
+# ============ 兼容旧版函数接口 ============
+
+
+def url_v1(song_id: int, level: str, cookies: Mapping[str, str]) -> dict[str, Any]:
+    return NeteaseClient(cookies).song_url_raw(song_id, level)
+
+
+def name_v1(song_id: int, cookies: Mapping[str, str] | None = None) -> dict[str, Any]:
+    return NeteaseClient(cookies).song_details_raw([song_id])
+
+
+def lyric_v1(song_id: int, cookies: Mapping[str, str]) -> dict[str, Any]:
+    return NeteaseClient(cookies).lyric_raw(song_id)
+
+
+def search_music(
+    keywords: str, cookies: Mapping[str, str], limit: int = 10
+) -> list[dict[str, Any]]:
+    return NeteaseClient(cookies).search(keywords, limit=limit)["items"]
+
+
+def playlist_detail(playlist_id: int, cookies: Mapping[str, str]) -> dict[str, Any]:
+    return NeteaseClient(cookies).playlist(playlist_id)
+
+
+def album_detail(album_id: int, cookies: Mapping[str, str]) -> dict[str, Any]:
+    return NeteaseClient(cookies).album(album_id)

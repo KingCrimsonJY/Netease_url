@@ -16,8 +16,6 @@ ignore = ["E501"]
 
 [tool.ruff.lint.per-file-ignores]
 # 旧代码，重写后删除
-"main.py" = ["F401", "F841"]
-"music_api.py" = ["B904"]
 "music_downloader.py" = ["B904"]
 
 [tool.pytest.ini_options]

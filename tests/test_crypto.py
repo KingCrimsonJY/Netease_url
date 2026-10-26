@@ -1,6 +1,6 @@
 """eapi 加密：与已在线验证过的实现保持逐字节一致。"""
 
-from music_api import CryptoUtils
+from music_api import eapi_encrypt
 
 SONG_URL_V1 = "https://interface3.music.163.com/eapi/song/enhance/player/url/v1"
 PAYLOAD = {"ids": [1901371647], "level": "standard", "encodeType": "flac", "header": "{}"}
@@ -15,4 +15,4 @@ EXPECTED = (
 
 
 def test_encrypt_matches_reference_vector():
-    assert CryptoUtils.encrypt_params(SONG_URL_V1, PAYLOAD) == EXPECTED
+    assert eapi_encrypt(SONG_URL_V1, PAYLOAD) == EXPECTED

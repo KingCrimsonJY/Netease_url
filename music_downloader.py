@@ -27,7 +27,7 @@ from typing import Any
 
 import requests
 
-from music_api import APIException, NeteaseAPI, load_cookies
+from music_api import CookieStore, NeteaseClient, NeteaseError
 
 # ============ 类型定义 ============
 
@@ -98,7 +98,8 @@ API_TYPE_TO_EXT = {
     "mp3": ".mp3",
     "flac": ".flac",
     "m4a": ".m4a",
-    "mp4": ".mp4",
+    "mp4": ".m4a",
+    "av3a": ".m4a",
     "ogg": ".ogg",
     "opus": ".opus",
 }
@@ -141,10 +142,10 @@ class MusicDownloader:
             ffmpeg_path: ffmpeg 可执行文件路径，为 None 时启动时检测一次
         """
         self.download_dir = Path(download_dir)
-        self.download_dir.mkdir(exist_ok=True)
+        self.download_dir.mkdir(parents=True, exist_ok=True)
         self.max_concurrent = max_concurrent
 
-        self.api = NeteaseAPI()
+        self.api = NeteaseClient(CookieStore("cookie.txt"))
 
         # ffmpeg 路径缓存：启动时检测一次，写入时还会再懒加载一次
         self.ffmpeg_path = ffmpeg_path or shutil.which("ffmpeg")
@@ -210,27 +211,14 @@ class MusicDownloader:
     def get_music_info(self, music_id: int, quality: str = "standard") -> MusicInfo:
         """获取音乐详细信息（同步）"""
         try:
-            cookies = load_cookies()
-
-            url_result = self.api.get_song_url(music_id, quality, cookies)
-            print(url_result)
-            if not url_result.get("data") or not url_result["data"]:
-                raise DownloadException(f"无法获取音乐ID {music_id} 的播放链接")
-
-            song_data = url_result["data"][0]
-            download_url = song_data.get("url", "")
-            if not download_url:
-                raise DownloadException(f"音乐ID {music_id} 无可用的下载链接")
-
-            detail_result = self.api.get_song_detail(music_id)
-            if not detail_result.get("songs") or not detail_result["songs"]:
-                raise DownloadException(f"无法获取音乐ID {music_id} 的详细信息")
-
-            song_detail = detail_result["songs"][0]
-
-            lyric_result = self.api.get_lyric(music_id, cookies)
-            lyric = lyric_result.get("lrc", {}).get("lyric", "") if lyric_result else ""
-            tlyric = lyric_result.get("tlyric", {}).get("lyric", "") if lyric_result else ""
+            source = self.api.song_url(music_id, quality)
+            if not source.available:
+                raise DownloadException(f"音乐ID {music_id}: {source.error_message}")
+            download_url = source.url
+            song_data = {"type": source.type or "mp3", "size": source.size}
+            song_detail = self.api.song_detail(music_id)
+            lyrics = self.api.lyrics(music_id)
+            lyric, tlyric = lyrics.lrc, lyrics.tlyric
 
             artists = "/".join(a["name"] for a in song_detail.get("ar", []))
 
@@ -245,15 +233,17 @@ class MusicDownloader:
                 download_url=download_url,
                 file_type=song_data.get("type", "mp3").lower(),
                 file_size=song_data.get("size", 0),
-                quality=quality,
+                quality=source.level or quality,
                 lyric=lyric,
                 tlyric=tlyric,
             )
 
-        except APIException as e:
-            raise DownloadException(f"API调用失败: {e}")
+        except DownloadException:
+            raise
+        except NeteaseError as e:
+            raise DownloadException(f"API调用失败: {e}") from e
         except Exception as e:
-            raise DownloadException(f"获取音乐信息时发生错误: {e}")
+            raise DownloadException(f"获取音乐信息时发生错误: {e}") from e
 
     # ----------- 文件路径 -----------
 
